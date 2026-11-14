@@ -24,6 +24,7 @@
 #include <boost/beast/core/error.hpp>
 #include <boost/beast/core/detail/clamp.hpp>
 #include <boost/asio/buffer.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -46,6 +47,7 @@ struct impl_base<true>
     {
         // `true` if current read message is compressed
         bool rd_set = false;
+        std::size_t rd_eb_consumed = 0;
 
         zlib::deflate_stream zo;
         zlib::inflate_stream zi;
@@ -70,6 +72,7 @@ struct impl_base<true>
         if(pmd_)
         {
             pmd_->rd_set = rsv1;
+            pmd_->rd_eb_consumed = 0;
             return true;
         }
         return ! rsv1; // pmd not negotiated
@@ -166,10 +169,25 @@ struct impl_base<true>
     void
     inflate(
         zlib::z_params& zs,
-        zlib::Flush flush,
         error_code& ec)
     {
-        pmd_->zi.write(zs, flush, ec);
+        pmd_->zi.write(zs, zlib::Flush::sync, ec);
+    }
+
+    // append the empty block codes and inflate
+    void
+    inflate_with_eb(
+        zlib::z_params& zs,
+        error_code& ec)
+    {
+        const std::uint8_t eb[4] = { 0x00, 0x00, 0xff, 0xff };
+        zs.next_in = eb + pmd_->rd_eb_consumed;
+        zs.avail_in = sizeof(eb) - pmd_->rd_eb_consumed;
+        inflate(zs, ec);
+        pmd_->rd_eb_consumed += zs.total_in;
+        BOOST_ASSERT(pmd_->rd_eb_consumed <= sizeof(eb));
+        if(ec == zlib::error::need_buffers)
+            ec.clear();
     }
 
     void
@@ -180,7 +198,23 @@ struct impl_base<true>
            (role == role_type::server &&
                 pmd_config_.client_no_context_takeover))
         {
-            pmd_->zi.clear();
+            /*  Not resetting the inflater for now, see
+                https://github.com/boostorg/beast/issues/3118
+
+                - RFC 7692 7.2.2 lets the receiver keep or drop the window;
+                  only the sender must drop it (7.2.1).
+                - Keeping it tolerates peers that agree to no context
+                  takeover but still refer back. Beast has done this since
+                  Boost 1.70: 8ea282e turned zi.reset() into zi.clear(),
+                  which was a no-op until the zlib 1.3.2 port.
+                - zi.reset() rejects such peers and keeps the window
+                  allocated; zi.clear() also frees it between messages
+                  (the memory saving the parameter exists for), at the
+                  cost of one allocation per message.
+                - Most implementations reset; Chromium, Firefox and a few
+                  libraries keep it. No known peer depends on keeping it.
+            */
+            // pmd_->zi.clear();
         }
     }
 
@@ -193,13 +227,70 @@ struct impl_base<true>
 
     void
     on_response_pmd(
-        http::response<http::string_body> const& res)
+        http::response<http::string_body> const& res,
+        error_code& ec)
     {
-        detail::pmd_offer offer;
-        detail::pmd_read(offer, res);
-        // VFALCO see if offer satisfies pmd_config_,
-        //        return an error if not.
-        pmd_config_ = offer; // overwrite for now
+        detail::pmd_offer const& offer = pmd_config_;
+        detail::pmd_offer agreed;
+        detail::pmd_read(agreed, res, ec);
+        if(ec)
+            return;
+
+        if(agreed.accept)
+        {
+            // RFC 7692 §5: a server must not accept a compression extension
+            // that the client did not offer.
+            if(! offer.accept)
+            {
+                BOOST_BEAST_ASSIGN_EC(ec, error::bad_sec_extensions);
+                return;
+            }
+
+            // RFC 7692 §7.1.2.1: server_max_window_bits limits the window
+            // used to compress server-to-client messages. When the offer
+            // specifies a limit, the server must not exceed it. An omitted
+            // response parameter implies the default 15-bit (32 KiB) window.
+            if(offer.server_max_window_bits > 0)
+            {
+                int const server_bits =
+                    agreed.server_max_window_bits == 0 ?
+                        15 : agreed.server_max_window_bits;
+                if(server_bits > offer.server_max_window_bits)
+                {
+                    BOOST_BEAST_ASSIGN_EC(ec, error::bad_sec_extensions);
+                    return;
+                }
+            }
+
+            // RFC 7692 §7.1.2.2: client_max_window_bits must have a value
+            // in the server's response, a bare parameter is invalid.
+            if(agreed.client_max_window_bits == -1)
+            {
+                BOOST_BEAST_ASSIGN_EC(ec, error::bad_sec_extensions);
+                return;
+            }
+
+            // RFC 7692 §7.1.2.2: the server must not return
+            // client_max_window_bits unless the client offered that parameter.
+            if( offer.client_max_window_bits == 0 &&
+                agreed.client_max_window_bits != 0)
+            {
+                BOOST_BEAST_ASSIGN_EC(ec, error::bad_sec_extensions);
+                return;
+            }
+
+            // RFC 7692 7.1.2.2: the server may select a smaller client
+            // window than offered. If omitted, or larger than the offer,
+            // use the offered limit as the effective value.
+            if(offer.client_max_window_bits > 0)
+            {
+                if( agreed.client_max_window_bits == 0 ||
+                    agreed.client_max_window_bits > offer.client_max_window_bits)
+                    agreed.client_max_window_bits = offer.client_max_window_bits;
+            }
+        }
+
+        pmd_config_ = agreed;
     }
 
     template<class Allocator>
@@ -238,7 +329,6 @@ struct impl_base<true>
         o = pmd_opts_;
     }
 
-
     void
     build_request_pmd(http::request<http::empty_body>& req)
     {
@@ -247,9 +337,11 @@ struct impl_base<true>
             detail::pmd_offer config;
             config.accept = true;
             config.server_max_window_bits =
-                pmd_opts_.server_max_window_bits;
+                pmd_opts_.server_max_window_bits == 15 ?
+                    0 : pmd_opts_.server_max_window_bits;
             config.client_max_window_bits =
-                pmd_opts_.client_max_window_bits;
+                pmd_opts_.client_max_window_bits == 15 ?
+                    -1 : pmd_opts_.client_max_window_bits;
             config.server_no_context_takeover =
                 pmd_opts_.server_no_context_takeover;
             config.client_no_context_takeover =
@@ -269,13 +361,20 @@ struct impl_base<true>
         {
             detail::pmd_normalize(pmd_config_);
             pmd_.reset(::new pmd_type);
+            /*  permessage-deflate allows a window of 8 bits (256 bytes),
+                which deflate does not support; zlib rejects it for raw
+                streams. Compress with a 9-bit window instead. This is
+                safe for the peer, because match distances never exceed
+                the window size minus 262, so a 256-byte inflate window
+                is never exceeded. The inflater keeps the negotiated size.
+            */
             if(role == role_type::client)
             {
                 pmd_->zi.reset(
                     pmd_config_.server_max_window_bits);
                 pmd_->zo.reset(
                     pmd_opts_.compLevel,
-                    pmd_config_.client_max_window_bits,
+                    (std::max)(pmd_config_.client_max_window_bits, 9),
                     pmd_opts_.memLevel,
                     zlib::Strategy::normal);
             }
@@ -285,7 +384,7 @@ struct impl_base<true>
                     pmd_config_.client_max_window_bits);
                 pmd_->zo.reset(
                     pmd_opts_.compLevel,
-                    pmd_config_.server_max_window_bits,
+                    (std::max)(pmd_config_.server_max_window_bits, 9),
                     pmd_opts_.memLevel,
                     zlib::Strategy::normal);
             }
@@ -302,12 +401,18 @@ struct impl_base<true>
         return pmd_ != nullptr;
     }
 
+    bool should_compress(std::size_t n_bytes) const
+    {
+        return n_bytes >= pmd_opts_.msg_size_threshold;
+    }
+
     std::size_t
     read_size_hint_pmd(
         std::size_t initial_size,
         bool rd_done,
+        std::size_t rd_msg_max,
         std::uint64_t rd_remain,
-        detail::frame_header const& rd_fh) const
+        frame_header const& rd_fh) const
     {
         using beast::detail::clamp;
         std::size_t result;
@@ -334,7 +439,16 @@ struct impl_base<true>
             initial_size, clamp(rd_remain));
     done:
         BOOST_ASSERT(result != 0);
+        // Ensure offered size does not exceed rd_msg_max
+        if(rd_msg_max)
+            result = clamp(result, rd_msg_max);
         return result;
+    }
+
+    void
+    get_config_pmd(detail::pmd_offer &pmd)
+    {
+        pmd = pmd_config_;
     }
 };
 
@@ -378,7 +492,13 @@ struct impl_base<false>
     void
     inflate(
         zlib::z_params&,
-        zlib::Flush,
+        error_code&)
+    {
+    }
+
+    void
+    inflate_with_eb(
+        zlib::z_params&,
         error_code&)
     {
     }
@@ -397,8 +517,10 @@ struct impl_base<false>
 
     void
     on_response_pmd(
-        http::response<http::string_body> const&)
+        http::response<http::string_body> const&,
+        error_code& ec)
     {
+        ec = {};
     }
 
     template<class Allocator>
@@ -447,10 +569,16 @@ struct impl_base<false>
         return false;
     }
 
+    bool should_compress(std::size_t) const
+    {
+        return false;
+    }
+
     std::size_t
     read_size_hint_pmd(
         std::size_t initial_size,
         bool rd_done,
+        std::size_t rd_msg_max,
         std::uint64_t rd_remain,
         frame_header const& rd_fh) const
     {
@@ -475,7 +603,16 @@ struct impl_base<false>
                 initial_size, clamp(rd_remain));
         }
         BOOST_ASSERT(result != 0);
+        // Ensure offered size does not exceed rd_msg_max
+        if(rd_msg_max)
+            result = clamp(result, rd_msg_max);
         return result;
+    }
+
+    void
+    get_config_pmd(detail::pmd_offer &pmd)
+    {
+        pmd = {};
     }
 };
 

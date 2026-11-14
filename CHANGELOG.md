@@ -1,3 +1,392 @@
+Version 362:
+
+* `http::ext_list` does not carry parameters from the previous extension into one that has none
+* `detail::base64::decoded_size` accounts for unpadded input
+* Fixed the `@tparam` name in the `buffers_iterator_type` documentation
+* `zlib::deflate_stream` and `zlib::inflate_stream` are ported from zlib 1.3.2
+* `zlib::deflate_stream::reset` rejects `windowBits` 8
+* `zlib::deflate_stream::write` returns `error::stream_error` for null buffer pointers
+* `zlib::deflate_stream` uses `memLevel` 8 by default
+* `zlib::inflate_stream::write` returns `error::stream_error` for null buffer pointers
+* `zlib::inflate_stream::write` errors from corrupt input are sticky until the stream is reset
+* `websocket::stream` answers a permessage-deflate `server_max_window_bits=8` offer with 8 instead of 9
+* `websocket::stream` fails the client handshake with `error::bad_sec_extensions` when the permessage-deflate response is malformed, was not offered, or exceeds the offered `server_max_window_bits`
+* `websocket::stream` compresses with the offered `client_max_window_bits` when the permessage-deflate response omits it or returns a larger value
+* `websocket::stream` omits `server_max_window_bits` from the permessage-deflate offer when it is the default of 15
+* `websocket::stream` offers `client_max_window_bits` without a value when it is the default of 15
+* `http::message::chunked` reports the framing of the last `Transfer-Encoding` field, matching the parser
+* `http::message::chunked` combines repeated `Transfer-Encoding` fields when setting or clearing the chunked encoding
+* `http::basic_parser` rejects a `Transfer-Encoding` value that is not a valid token list
+* The example root certificates are regenerated from NSS 3.132 and exclude the eMudhra emSign roots
+* `http::async_read` honors cancellation between intermediate reads
+* `http::async_read_some` does not complete inside the initiating function on `error::buffer_overflow`
+* `websocket::stream` honors cancellation between intermediate operations
+* `beast::async_write` honors cancellation between intermediate writes
+* `saved_handler` move construction and move assignment accept an empty source
+
+--------------------------------------------------------------------------------
+
+Version 361:
+
+* `websocket::stream` accepts close code 1014 (bad gateway)
+* `http::basic_parser` ignores connection and framing fields in trailers
+* `http::parser` drops framing and connection-control fields carried in trailers
+* `http::basic_parser` rejects chunked transfer-encoding in HTTP/1.0 requests
+* `http::basic_parser` rejects `Content-Length` with `Transfer-Encoding` regardless of field order
+* `http::basic_parser` rejects requests with a `Transfer-Encoding` that does not end in chunked
+* `http::basic_parser` validates quoted-strings in chunk extensions
+* `http::message::prepare_payload` rejects 1xx responses with a body
+* `websocket::stream` rejects 64-bit frame lengths with the high bit set
+* File operations clear the `error_code` on success
+* The `server-flex-awaitable` example dispatches cancellation to the task's strand
+* Removed dependency on Boost.Functional
+
+--------------------------------------------------------------------------------
+
+Version 360:
+
+* Enforced 8KB sanity limit on chunk headers
+* Made OpenSSL an optional dependency for tests
+* Fixed typecast warnings in `inflate_with_eb`
+* Removed dependency on Boost.StaticAssert
+* Added `HTTP2-Settings` to HTTP field enum
+
+--------------------------------------------------------------------------------
+
+Version 359:
+
+* Removed dependency on Boost.Preprocessor
+* Removed dependency on Boost.StaticString
+* `http::parser` rejects non-standard trailer fields by default
+* `http::basic_parser` uses a dedicated callback for trailer fields
+* `http::field` constants are updated
+* Added `http::basic_fields::contains` member function
+* `http::buffer_body` ignores empty chunks
+* Fixed allocator move/copy assignment in `flat_buffer` and `multi_buffer`
+* Fixed websocket permessage-deflate error on partial message consumption
+
+--------------------------------------------------------------------------------
+
+Version 358:
+
+* Added missing `cstdint` header to `detail/cpu_info.hpp`
+* Conditionally defined `immediate_executor_type` in `async_base`
+* Replaced `detail/work_guard.hpp` with `net::executor_work_guard`
+* Used `handshake_timeout` for closing handshake during read operations
+* Removed moved sections from documentation
+* Removed superfluous log messages from tests
+* Fixed portability issues for building tests in MinGW
+* Fixed `std::is_trivial` deprecation warnings
+* Fixed `-Wmaybe-uninitialized` warnings
+
+--------------------------------------------------------------------------------
+
+Version 357:
+
+* Added new examples for Unix domain sockets
+* Added SSL/TLS Certificate section to documentation
+* Updated SSL examples to verify peer certificate hostname
+* Improved documentation of `websocket::stream::async_close`
+* WebSockets: Peer pings are counted as activity for `idle_timeout`
+* Fixed out-of-bounds access in `iequals` function
+* Removed Boost.Scope dependency from examples
+* Refactored CMakeLists
+
+--------------------------------------------------------------------------------
+
+Version 356:
+
+* Added `error_code` overload for `basic_fields::insert()`
+* Added overload for `websocket::stream::get_status` to query permessage-deflate status
+* Fixed use-after-move in calls to `net::dispatch` within `http::basic_stream`, which caused `bad_executor` exceptions on timeouts
+* Removed mutating operations in initiating functions
+* Fixed cancellation handling in `teardown_tcp_op`
+* Set `state_` in `basic_parser` before calling `on_finish_impl`
+* Removed static specifier from `clamp` functions
+* Addressed `-Wattributes` warnings in tests
+* Addressed unreachable code warning in tests
+* Added forward declaration headers for types in `beast::http` namespace
+* Enabled `http::parser` to use `basic_fields::insert()` with `error_code` overload
+* Applied `header_limit_` in `http::basic_parser` to trailer headers
+* Improved `http::basic_parser` to return `http::error::header_limit` earlier
+* Added support for modular boost build structure
+
+--------------------------------------------------------------------------------
+
+Version 355:
+
+* awaitable examples are simplified
+* server-flex-awaitable example demonstrates an explicit, graceful shutdown
+* Add fuzzing targets
+* Fix overloads that are ambiguous when using default completion tokens
+* Fix misplaced static_assert in `http::basic_fields` move-assignment operator
+* Fix narrowing conversion in `read_size_hint_db()`
+
+--------------------------------------------------------------------------------
+
+Version 354:
+
+* `ssl_stream` and `flat_stream` are deprecated (Use `net::ssl::stream` instead)
+* `net::ssl::stream` is canonical in examples and snippets
+* `ssl_stream` does not use `flat_stream`
+* Add `SSL/TLS Shutdown Procedure` section to documentation
+* Add HTTP status code 418 ("I'm a teapot")
+* `websocket::stream::read_size_hint()` does not exceed read_message_max
+* Fix underflow of `bytes_transferred` in websocket partial write operations
+* Fix error handling of SSL/TLS shutdown operations in examples
+* Fix handling of expired timers in `basic_stream::ops::transfer_op`
+* Fix ambiguity in `test::basic_stream` constructor overloads
+* Fix partial parsing of the final chunk in `http::parser`
+* Fix dereferenced null pointer warning in `test::immediate_executor`
+* Fix warnings in tests
+* Fix OpenSSL builds in GHA CI and Drone CI
+* Fix `test::immediate_executor` type traits 
+* Refactor Jamfiles to limit the scope of definitions
+* Expand CI matrix
+
+--------------------------------------------------------------------------------
+
+Version 353:
+
+* Fix unreachable code warning in `buffers_cat.hpp`
+* Fix zlib name conflicts
+* Status code list confirms with IANA registry
+* Add `const_iterator` to `buffers_adaptor::subrange`
+* Improve documentation
+
+--------------------------------------------------------------------------------
+
+Version 352:
+
+* Fix paragraph separation issue in the documentation
+* Improve documentation for `http::message::prepare_payload()`
+* Strengthen the buffer contract on `flat_buffer` and `flat_static_buffer`
+* Add a non-allocating overload for the error category message function
+* Replace internal uses of `beast::bind_front_handler` with `asio::prepend`
+* Specialize `asio::associator` for `bind_wrapper` and `bind_front_wrapper`
+* Fix an infinite loop bug in `websocker_server_awaitable.cpp`
+* Fix the write loop in advanced server examples
+
+--------------------------------------------------------------------------------
+
+Version 351:
+
+* Use the explicit type std::size_t when completing transfer_op
+
+--------------------------------------------------------------------------------
+
+Version 350:
+
+* Allocation and invocation hooks are removed
+* `detail::bind_default_executor` helper is removed
+* Improve documentation for `websocket::stream::async_write_some`
+
+--------------------------------------------------------------------------------
+
+Version 349:
+
+* Add support for `immediate_executor`
+* `BOOST_ASIO_INITFN_AUTO_RES` replaces `BOOST_ASIO_INITFN_RESULT_TYPE`
+* Update license info for `work_guard`
+* Correct handler requirements of ping/pong
+* Improve Drone caching
+* `server-flex-awaitable` example now resets parser
+* OpenSSL 1.1.1.2100 or later is required for x86
+* GCC 5.0 or later is required
+* Introduce self-hosted GitHub actions runners
+* Minor documentation fixes and updates
+
+--------------------------------------------------------------------------------
+
+Version 348:
+
+* multiple CI fixes
+* jamfile uses openssl.jam
+* websocket uses upper case Upgrade for connection field
+* ssl_stream does not use BOOST_BEAST_ASYNC_TPARAM1 because of clang-16
+* doc updates
+
+--------------------------------------------------------------------------------
+
+Version 347:
+
+* `placeholder` ambiguity fix.
+* awaitable server example fix
+* doc updates.
+
+--------------------------------------------------------------------------------
+
+Version 346:
+
+* beast file_body & file support seek
+* file_body buffer size can be configured
+* examples & tests use context instead of coroutine
+* basic_stream doesn't use try-catch with no-exceptions set
+* error categories use numeric id
+* timer inside basic_stream uses the right executor
+* self-posting is posting to the io-object's executor
+* all error_codes use source_locations
+
+--------------------------------------------------------------------------------
+
+Version 345:
+
+* Warning & typo fixes.
+
+--------------------------------------------------------------------------------
+
+Version 344:
+
+* Internal fixes adopting to asio changes.
+
+
+--------------------------------------------------------------------------------
+
+Version 343:
+
+* Beast IO-objects support rebinding constructors
+* C++20 coroutine examples
+
+--------------------------------------------------------------------------------
+
+Version 342:
+
+* Support per operation cancellation
+
+--------------------------------------------------------------------------------
+
+Version 341:
+
+*  Expect header field with the "100-continue" is handled in upgrade.
+
+--------------------------------------------------------------------------------
+
+Version 340:
+
+* buffers have a features table in the docs
+* buffer_ref allows using beast buffers with asio
+* buffer_adaptor works with multi-buffer
+
+--------------------------------------------------------------------------------
+
+Version 339:
+
+* BOOST_BEAST_USE_STD_STRING_VIEW is replaced by boost/core string_view.
+* defining BOOST_BEAST_USE_STD_STRING_VIEW yields a deprecation warning
+
+--------------------------------------------------------------------------------
+
+Version 338:
+
+* Added per message compression options.
+
+--------------------------------------------------------------------------------
+
+Version 337:
+
+* Added timeout option to websocket
+
+--------------------------------------------------------------------------------
+
+Version 336:
+
+* Remove incorrect ASSERT in WebSocket read.
+
+--------------------------------------------------------------------------------
+
+Version 335:
+
+* Reduce size of multi_buffer.
+* Upgrade OS on some drone CI jobs.
+
+--------------------------------------------------------------------------------
+
+Version 334:
+
+* Fix version number in CML.
+
+--------------------------------------------------------------------------------
+
+Version 333:
+
+* Workaround TSAN CI bug.
+
+--------------------------------------------------------------------------------
+
+Version 332:
+
+* Fix beast::zlib warnings
+* Improve documentation
+
+--------------------------------------------------------------------------------
+
+Version 331:
+
+* Using core::string_view instead of utility::string_view
+* Use static_string from Boost.StaticString
+* Use span from Boost.Core
+* Fix CVE-2018-25032 in zlib streams
+* Add http::message_generator
+* Add buffers_generator
+* serializer::is_done is const
+
+--------------------------------------------------------------------------------
+
+Version 330:
+
+* Update release notes for Boost 1.79.
+
+--------------------------------------------------------------------------------
+
+Version 329:
+
+* Add missing include in `file_body` test.
+
+--------------------------------------------------------------------------------
+
+Version 328:
+
+* Add ARM64 builds to Drone CI.
+
+--------------------------------------------------------------------------------
+
+Version 327:
+
+* Fix async_base documentation link.
+
+--------------------------------------------------------------------------------
+
+Version 326:
+
+* Remove GitHub stalebot.
+
+--------------------------------------------------------------------------------
+
+Version 325:
+
+* WebSocket handshake response is deterministic on failure.
+
+--------------------------------------------------------------------------------
+
+Version 324:
+
+* Fix open append mode for file_posix.
+* Fix open append mode for file_win32.
+* Add tests for file open in append mode.
+* Fix file open with append/append_existing flag on Windows.
+
+--------------------------------------------------------------------------------
+
+Version 323:
+
+* Fix clang-cl UTF8 path handling for `file_win32`.
+* Fix clang-cl UTF8 path handling for `file_stdio`.
+* Add individual tests to CMake workflow.
+* Update CI to include gcc 11, clang 12, msvc 14.3.
+* Update code coverage settings.
+
+--------------------------------------------------------------------------------
+
 Version 322:
 
 * Fix typo in `_experimental::test::basic_stream` documentation.
@@ -172,10 +561,10 @@ Version 301:
 API Changes:
 
 * Previously, `teardown` and `async_teardown` of a websocket connection over SSL
-  would only shut down the SSL layer, leaving the TCP layer connected. Now the 
-  SSL teardown will tear down both the SSL and TCP layers, cleanly shutting down 
+  would only shut down the SSL layer, leaving the TCP layer connected. Now the
+  SSL teardown will tear down both the SSL and TCP layers, cleanly shutting down
   the TCP connection and closing the socket.
-  Should the client expect the TCP socket to remain connected, users will need to 
+  Should the client expect the TCP socket to remain connected, users will need to
   re-engineer their code.
 
 --------------------------------------------------------------------------------
@@ -211,15 +600,15 @@ Version 297:
 
 API Changes:
 
-* `string_param`, which was previously the argument type when setting field values 
-   has been replaced by `string_view`. Because of this, it is no longer possible to 
-   set message field values directly as integrals. 
+* `string_param`, which was previously the argument type when setting field values
+   has been replaced by `string_view`. Because of this, it is no longer possible to
+   set message field values directly as integrals.
 
-   Users are required to convert numeric arguments to a string type prior to calling 
+   Users are required to convert numeric arguments to a string type prior to calling
    `fields::set` et. al.
-   
+
    Beast provides the non-allocating `to_static_string()` function for this purpose.
-   
+
    To set Content-Length field manually, call `message::content_length`.
 
 --------------------------------------------------------------------------------
@@ -240,7 +629,7 @@ Version 296:
 API Changes:
 
 * The file `core/buffers_adapter.hpp` has been removed along with the deprecated
-  alias typename `buffers_adapter`. Affected programs should use 
+  alias typename `buffers_adapter`. Affected programs should use
   `core/buffers_adapator.hpp` and the type `buffers_adaptor`.
 
 * The error code enum `invalid_code_lenths` was a synonym of `invalid_code_lengths`.
@@ -250,7 +639,7 @@ API Changes:
   the type trait `is_completion_handler`. Beast uses the CompletionHandler correctness
   checks provided by Asio. In a c++20 environment, these convert to concept checks.
 
-* The `reset` function has been removed from `flat_static_buffer`. Use the 
+* The `reset` function has been removed from `flat_static_buffer`. Use the
   `clear` function instead.
 
 * Code that depends on `mutable_data_type` should be refactored to use
@@ -261,7 +650,7 @@ API Changes:
   - `multi_buffer`
   - `static_buffer`
 
-* handler_ptr has been removed. Users should use net::bind_handler and/or 
+* handler_ptr has been removed. Users should use net::bind_handler and/or
 bind_front_handler instead.
 
 * websocket::role_type has been removed. Users should use beast::role_type instead.
@@ -276,7 +665,7 @@ Programs still using these names should be refactored to use the `decorator` fea
 the remaining handshake and accept functions.
 
 * The macro BOOST_BEAST_NO_DEPRECATED will no longer be noticed by Beast. The only way to
-enable deprecated functionality is now the macro BOOST_BEAST_ALLOW_DEPRECATED which is 
+enable deprecated functionality is now the macro BOOST_BEAST_ALLOW_DEPRECATED which is
 undefined by default. That is, all deprecated behaviour is disabled by default.
 
 --------------------------------------------------------------------------------
@@ -318,7 +707,7 @@ by the HTTP parser:
 - http::async_read_header
 - http::async_read_some
 
-As of now, the `bytes_transferred` return value will indicate the number of bytes 
+As of now, the `bytes_transferred` return value will indicate the number of bytes
 consumed by the parser when parsing an http message.
 
 Actions Required:
@@ -346,7 +735,7 @@ Behaviour Changes:
 Version 292:
 
 * Fix compile errors on Visual Studio with /std:c++latest
-* Fix standalone compilation error with std::string_view 
+* Fix standalone compilation error with std::string_view
 * OpenSSL 1.0.2 or later is required
 * Fix c++20 deprecation warning in span_body
 
@@ -415,7 +804,7 @@ API Changes:
   - flat_static_buffer
   - multi_buffer
   - static_buffer
-  
+
 * Nested mutable_data_type in Beast dynamic buffers is deprecated:
 
 Changes Required:

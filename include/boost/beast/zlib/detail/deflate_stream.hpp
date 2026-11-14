@@ -8,7 +8,7 @@
 //
 // This is a derivative work based on Zlib, copyright below:
 /*
-    Copyright (C) 1995-2013 Jean-loup Gailly and Mark Adler
+    Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler
 
     This software is provided 'as-is', without any express or implied
     warranty.  In no event will the authors be held liable for any damages
@@ -42,7 +42,6 @@
 #include <boost/beast/zlib/detail/ranges.hpp>
 #include <boost/assert.hpp>
 #include <boost/config.hpp>
-#include <boost/optional.hpp>
 #include <boost/throw_exception.hpp>
 #include <cstdint>
 #include <cstdlib>
@@ -87,30 +86,30 @@ protected:
     static std::uint16_t constexpr maxMatch = 258;
 
     // Can't change minMatch without also changing code, see original zlib
-    BOOST_STATIC_ASSERT(minMatch == 3);
+    BOOST_CORE_STATIC_ASSERT(minMatch == 3);
 
     // end of block literal code
-    static std::uint16_t constexpr END_BLOCK = 256;
+    static std::uint16_t constexpr end_block = 256;
 
     // repeat previous bit length 3-6 times (2 bits of repeat count)
-    static std::uint8_t constexpr REP_3_6 = 16;
+    static std::uint8_t constexpr rep_3_6 = 16;
 
     // repeat a zero length 3-10 times  (3 bits of repeat count)
-    static std::uint8_t constexpr REPZ_3_10 = 17;
+    static std::uint8_t constexpr repz_3_10 = 17;
 
     // repeat a zero length 11-138 times  (7 bits of repeat count)
-    static std::uint8_t constexpr REPZ_11_138 = 18;
+    static std::uint8_t constexpr repz_11_138 = 18;
 
     // The three kinds of block type
-    static std::uint8_t constexpr STORED_BLOCK = 0;
-    static std::uint8_t constexpr STATIC_TREES = 1;
-    static std::uint8_t constexpr DYN_TREES    = 2;
+    static std::uint8_t constexpr stored_block = 0;
+    static std::uint8_t constexpr static_trees = 1;
+    static std::uint8_t constexpr dyn_trees    = 2;
 
     // Maximum value for memLevel in deflateInit2
     static std::uint8_t constexpr max_mem_level = 9;
 
     // Default memLevel
-    static std::uint8_t constexpr DEF_MEM_LEVEL = max_mem_level;
+    static std::uint8_t constexpr def_mem_level = 8;
 
     /*  Note: the deflate() code requires max_lazy >= minMatch and max_chain >= 4
         For deflate_fast() (levels <= 3) good is ignored and lazy has a different
@@ -118,13 +117,16 @@ protected:
     */
 
     // maximum heap size
-    static std::uint16_t constexpr HEAP_SIZE = 2 * lCodes + 1;
+    static std::uint16_t constexpr heap_size = 2 * lCodes + 1;
 
     // size of bit buffer in bi_buf
     static std::uint8_t constexpr Buf_size = 16;
 
     // Matches of length 3 are discarded if their distance exceeds kTooFar
     static std::size_t constexpr kTooFar = 4096;
+
+    // Maximum stored block length in deflate format (not including header)
+    static unsigned constexpr kMaxStored = 65535;
 
     /*  Minimum amount of lookahead, except at the end of the input file.
         See deflate.c for comments about the minMatch+1.
@@ -229,12 +231,12 @@ protected:
     // VFALCO This might not be needed, e.g. for zip/gzip
     enum StreamStatus
     {
-        EXTRA_STATE = 69,
-        NAME_STATE = 73,
-        COMMENT_STATE = 91,
-        HCRC_STATE = 103,
-        BUSY_STATE = 113,
-        FINISH_STATE = 666
+        extra_state = 69,
+        name_state = 73,
+        comment_state = 91,
+        hcrc_state = 103,
+        busy_state = 113,
+        finish_state = 666
     };
 
     /* A std::uint16_t is an index in the character window. We use short instead of int to
@@ -259,8 +261,12 @@ protected:
         pending_buf_size_;          // size of pending_buf
     Byte* pending_out_;             // next pending byte to output to the stream
     uInt pending_;                  // nb of bytes in the pending buffer
-    boost::optional<Flush>
-        last_flush_;                // value of flush param for previous deflate call
+
+    /*  Value of the flush parameter for the previous call to write,
+        or -1 to avoid returning need_buffers on the next call, or -2
+        if write has not been called since the stream was reset.
+    */
+    int last_flush_;
 
     uInt w_size_;                   // LZ77 window size (32K by default)
     uInt w_bits_;                   // log2(w_size)  (8..16)
@@ -343,7 +349,7 @@ protected:
     int nice_match_;                // Stop searching when current match exceeds this
 
     ct_data dyn_ltree_[
-        HEAP_SIZE];                 // literal and length tree
+        heap_size];                 // literal and length tree
     ct_data dyn_dtree_[
         2*dCodes+1];                // distance tree
     ct_data bl_tree_[
@@ -370,7 +376,7 @@ protected:
     // Depth of each subtree used as tie breaker for trees of equal frequency
     std::uint8_t depth_[2*lCodes+1];
 
-    std::uint8_t *l_buf_;           // buffer for literals or lengths
+    std::uint8_t *sym_buf_;           // buffer for distances and literals or lengths
 
     /*  Size of match buffer for literals/lengths.
         There are 4 reasons for limiting lit_bufsize to 64K:
@@ -391,13 +397,9 @@ protected:
           - I can't count above 4
     */
     uInt lit_bufsize_;
-    uInt last_lit_;                 // running index in l_buf_
 
-    /*  Buffer for distances. To simplify the code, d_buf_ and l_buf_
-        have the same number of elements. To use different lengths, an
-        extra flag array would be necessary.
-    */
-    std::uint16_t* d_buf_;
+    uInt sym_next_;      /* running index in sym_buf */
+    uInt sym_end_;       /* symbol table full when sym_next reaches this */
 
     std::uint32_t opt_len_;         // bit length of current block with optimal trees
     std::uint32_t static_len_;      // bit length of current block with static trees
@@ -621,8 +623,7 @@ protected:
     BOOST_BEAST_DECL std::size_t doUpperBound (std::size_t sourceLen) const;
     BOOST_BEAST_DECL void doTune              (int good_length, int max_lazy, int nice_length, int max_chain);
     BOOST_BEAST_DECL void doParams            (z_params& zs, int level, Strategy strategy, error_code& ec);
-    BOOST_BEAST_DECL void doWrite             (z_params& zs, boost::optional<Flush> flush, error_code& ec);
-    BOOST_BEAST_DECL void doDictionary        (Byte const* dict, uInt dictLength, error_code& ec);
+    BOOST_BEAST_DECL void doWrite             (z_params& zs, Flush flush, error_code& ec);
     BOOST_BEAST_DECL void doPrime             (int bits, int value, error_code& ec);
     BOOST_BEAST_DECL void doPending           (unsigned* value, int* bits);
 
@@ -641,7 +642,6 @@ protected:
     BOOST_BEAST_DECL int  detect_data_type    ();
     BOOST_BEAST_DECL void bi_windup           ();
     BOOST_BEAST_DECL void bi_flush            ();
-    BOOST_BEAST_DECL void copy_block          (char *buf, unsigned len, int header);
 
     BOOST_BEAST_DECL void tr_init             ();
     BOOST_BEAST_DECL void tr_align            ();
@@ -651,6 +651,7 @@ protected:
     BOOST_BEAST_DECL void tr_tally_lit        (std::uint8_t c, bool& flush);
 
     BOOST_BEAST_DECL void tr_flush_block      (z_params& zs, char *buf, std::uint32_t stored_len, int last);
+    BOOST_BEAST_DECL void slide_hash          ();
     BOOST_BEAST_DECL void fill_window         (z_params& zs);
     BOOST_BEAST_DECL void flush_pending       (z_params& zs);
     BOOST_BEAST_DECL void flush_block         (z_params& zs, bool last);
@@ -702,7 +703,7 @@ Unsigned
 deflate_stream::
 bi_reverse(Unsigned code, unsigned len)
 {
-    BOOST_STATIC_ASSERT(std::is_unsigned<Unsigned>::value);
+    BOOST_CORE_STATIC_ASSERT(std::is_unsigned<Unsigned>::value);
     BOOST_ASSERT(len <= 8 * sizeof(unsigned));
     Unsigned res = 0;
     do

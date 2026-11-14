@@ -25,6 +25,12 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/write.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/connect_pipe.hpp>
+#include <boost/asio/readable_pipe.hpp>
+#include <boost/asio/writable_pipe.hpp>
 #include <atomic>
 
 #if BOOST_ASIO_HAS_CO_AWAIT
@@ -380,6 +386,7 @@ public:
             net::io_context ioc;
             test::stream ts{ioc,
                 "GET / HTTP/1.1\r\n\r\n"};
+            ts.close(); // make sure the read completes
             BEAST_EXPECT(handler::count() == 0);
             multi_buffer b;
             request<dynamic_body> m;
@@ -693,6 +700,25 @@ public:
         }
 
         {
+            // bytes_transferred returns length of header
+            request_parser<string_body> p;
+            test::stream s(ioc);
+            s.append(string_view(hdr));
+            s.append(string_view(body));
+            std::string res ;
+            auto fb = asio::dynamic_buffer(res);
+            error_code ec;
+            auto bt = read_header(s, fb, p, ec);
+            BEAST_EXPECTS(!ec, ec.message());
+            BEAST_EXPECT(bt == hdr.size());
+
+            // next read should be zero-size, success
+            bt = read_header(s, fb, p, ec);
+            BEAST_EXPECTS(!ec, ec.message());
+            BEAST_EXPECTS(bt == 0, std::to_string(0));
+        }
+
+        {
             // incomplete header consumes all parsable header bytes
             request_parser<string_body> p;
             test::stream s(ioc);
@@ -710,6 +736,121 @@ public:
         }
     }
 
+    void
+    testCancellation(yield_context do_yield)
+    {
+        // this is tested on a pipe
+        // because the test::stream doesn't implement cancellation 
+        {
+            response<string_body> m;
+            error_code ec;
+            net::writable_pipe ts{ioc_};
+            net::readable_pipe tr{ioc_};
+            net::connect_pipe(tr, ts);
+            net::cancellation_signal cl;
+            net::post(ioc_, [&]{cl.emit(net::cancellation_type::all);});
+            net::steady_timer timeout(ioc_, std::chrono::seconds(5));
+            timeout.async_wait(
+                [&](error_code ec)
+                {
+                    BEAST_EXPECT(ec == net::error::operation_aborted);
+                    if (!ec) // this means the cancel failed!
+                        ts.close();
+                });
+            multi_buffer b;
+            async_read(tr, b, m, net::bind_cancellation_slot(cl.slot(), do_yield[ec]));
+            timeout.cancel();
+            BEAST_EXPECT(ec == net::error::operation_aborted);
+        }
+        {
+            response<string_body> m;
+            error_code ec;
+            net::writable_pipe ts{ioc_};
+            net::readable_pipe tr{ioc_};
+            net::connect_pipe(tr, ts);
+            net::cancellation_signal cl;
+            net::post(ioc_, [&]{cl.emit(net::cancellation_type::all);});
+            net::steady_timer timeout(ioc_, std::chrono::seconds(5));
+            timeout.async_wait(
+                [&](error_code ec)
+                {
+                    // using BEAST_EXPECT HERE is a race condition, since the test suite might
+                    BEAST_EXPECT(ec == net::error::operation_aborted);
+                    if (!ec) // this means the cancel failed!
+                        ts.close();
+                });
+            multi_buffer b;
+            async_read(tr, b, m, net::bind_cancellation_slot(cl.slot(), do_yield[ec]));
+            timeout.cancel();
+            BEAST_EXPECT(ec == net::error::operation_aborted);
+        }
+        // the timer handler may be invoked after the test suite is complete if we don't post.
+        asio::post(ioc_, do_yield);
+    }
+
+    void
+    testCancellationBetweenReads()
+    {
+        auto const check = [](string_view input, error_code expected)
+        {
+            net::io_context ioc;
+            test::stream ts(ioc, input);
+            // eof follows the input, so a read that should
+            // have been cancelled fails instead of hanging
+            ts.close_remote();
+            flat_buffer b;
+            request<string_body> m;
+            net::cancellation_signal sig;
+            bool invoked = false;
+            net::post(ioc, [&]{ sig.emit(net::cancellation_type::terminal); });
+            async_read(ts, b, m, net::bind_cancellation_slot(sig.slot(),
+                [&](error_code ec, std::size_t)
+                {
+                    invoked = true;
+                    BEAST_EXPECTS(ec == expected, ec.message());
+                }));
+            ioc.run();
+            BEAST_EXPECT(invoked);
+        };
+
+        // read_some_op: the parser needs more after the read_some
+        check("GET / HTTP/1.1\r\n", net::error::operation_aborted);
+
+        // read_op: the header is done but the body is not
+        check(
+            "POST / HTTP/1.1\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n", net::error::operation_aborted);
+
+        // the read_some completes the message
+        check(
+            "GET / HTTP/1.1\r\n"
+            "\r\n", {});
+    }
+
+    void
+    testBufferOverflowNotInline()
+    {
+        net::io_context ioc;
+        test::stream ts(ioc);
+        // an incomplete start line which fills the buffer
+        flat_static_buffer<16> b;
+        b.commit(net::buffer_copy(
+            b.prepare(16), net::buffer("GET /aaaaaaaaaaa", 16)));
+        request_parser<string_body> p;
+        bool initiating = true;
+        bool invoked = false;
+        async_read_some(ts, b, p,
+            [&](error_code ec, std::size_t)
+            {
+                invoked = true;
+                BEAST_EXPECT(! initiating);
+                BEAST_EXPECTS(ec == error::buffer_overflow, ec.message());
+            });
+        initiating = false;
+        ioc.run();
+        BEAST_EXPECT(invoked);
+    }
 
     void
     run() override
@@ -742,6 +883,13 @@ public:
                      testReadSomeHeader(yield);
                  });
         testReadSomeHeader();
+        yield_to(
+            [&](yield_context yield)
+            {
+                testCancellation(yield);
+            });
+        testCancellationBetweenReads();
+        testBufferOverflowNotInline();
     }
 
 

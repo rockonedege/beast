@@ -23,6 +23,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/bind/placeholders.hpp>
+#include <boost/bind/std_placeholders.hpp>
 #include <boost/core/exchange.hpp>
 #include <memory>
 #include <string>
@@ -186,7 +187,7 @@ public:
             if (blocking_ == net::execution::blocking.possibly)
             {
                 s_.on_invoke();
-                net::execution::execute(ex_, std::forward<F>(f));
+                ex_.execute(std::forward<F>(f));
             }
             else
             {
@@ -220,18 +221,16 @@ public:
         dispatch(F&& f, Alloc const& a)
         {
             s_.on_invoke();
-            net::execution::execute(
-                net::prefer(ex_,
-                    net::execution::blocking.possibly,
-                    net::execution::allocator(a)),
-                std::forward<F>(f));
+            net::prefer(ex_,
+                net::execution::blocking.possibly,
+                net::execution::allocator(a)).execute(std::forward<F>(f));
             // previously equivalent to
             // ex_.dispatch(std::forward<F>(f), a);
         }
 
         template<class F, class Alloc>
         void
-        post(F&& f, Alloc const& a)
+        post(F&&, Alloc const&)
         {
             // shouldn't be called since the enclosing
             // networking wrapper only uses dispatch
@@ -240,7 +239,7 @@ public:
 
         template<class F, class Alloc>
         void
-        defer(F&& f, Alloc const& a)
+        defer(F&&, Alloc const&)
         {
             // shouldn't be called since the enclosing
             // networking wrapper only uses dispatch
@@ -250,9 +249,9 @@ public:
     };
 
 #if defined(BOOST_ASIO_NO_TS_EXECUTORS)
-    BOOST_STATIC_ASSERT(net::execution::is_executor<test_executor>::value);
+    BOOST_CORE_STATIC_ASSERT(net::execution::is_executor<test_executor>::value);
 #else
-    BOOST_STATIC_ASSERT(net::is_executor<test_executor>::value);
+    BOOST_CORE_STATIC_ASSERT(net::is_executor<test_executor>::value);
 #endif
 
     class test_cb

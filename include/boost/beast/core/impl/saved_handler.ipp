@@ -27,6 +27,8 @@ saved_handler::
 saved_handler(saved_handler&& other) noexcept
     : p_(boost::exchange(other.p_, nullptr))
 {
+    if(p_)
+        p_->set_owner(this);
 }
 
 saved_handler&
@@ -36,6 +38,8 @@ operator=(saved_handler&& other) noexcept
     // Can't delete a handler before invoking
     BOOST_ASSERT(! has_value());
     p_ = boost::exchange(other.p_, nullptr);
+    if(p_)
+        p_->set_owner(this);
     return *this;
 }
 

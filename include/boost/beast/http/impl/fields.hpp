@@ -23,8 +23,6 @@
 #include <boost/beast/http/chunk_encode.hpp>
 #include <boost/core/exchange.hpp>
 #include <boost/throw_exception.hpp>
-#include <stdexcept>
-#include <string>
 
 namespace boost {
 namespace beast {
@@ -434,15 +432,12 @@ template<class Allocator>
 auto
 basic_fields<Allocator>::
 operator=(basic_fields&& other) noexcept(
-    alloc_traits::propagate_on_container_move_assignment::value)
-      -> basic_fields&
+    pocma::value && std::is_nothrow_move_assignable<Allocator>::value)
+    -> basic_fields&
 {
-    static_assert(is_nothrow_move_assignable<Allocator>::value,
-        "Allocator must be noexcept assignable.");
     if(this == &other)
         return *this;
-    move_assign(other, std::integral_constant<bool,
-        alloc_traits:: propagate_on_container_move_assignment::value>{});
+    move_assign(other, pocma{});
     return *this;
 }
 
@@ -452,8 +447,7 @@ basic_fields<Allocator>::
 operator=(basic_fields const& other) ->
     basic_fields&
 {
-    copy_assign(other, std::integral_constant<bool,
-        alloc_traits::propagate_on_container_copy_assignment::value>{});
+    copy_assign(other, pocca{});
     return *this;
 }
 
@@ -543,7 +537,7 @@ template<class Allocator>
 inline
 void
 basic_fields<Allocator>::
-insert(field name, string_view const& value)
+insert(field name, string_view value)
 {
     BOOST_ASSERT(name != field::unknown);
     insert(name, to_string(name), value);
@@ -552,58 +546,52 @@ insert(field name, string_view const& value)
 template<class Allocator>
 void
 basic_fields<Allocator>::
-insert(string_view sname, string_view const& value)
+insert(string_view sname, string_view value)
 {
-    auto const name =
-        string_to_field(sname);
-    insert(name, sname, value);
+    insert(
+        string_to_field(sname), sname, value);
+}
+
+template<class Allocator>
+void
+basic_fields<Allocator>::
+insert(
+    field name,
+    string_view sname,
+    string_view value,
+    error_code& ec)
+{
+    ec = {};
+    auto* e = try_create_new_element(name, sname, value, ec);
+    if(ec.failed())
+        return;
+    insert_element(*e);
 }
 
 template<class Allocator>
 void
 basic_fields<Allocator>::
 insert(field name,
-    string_view sname, string_view const& value)
+    string_view sname, string_view value)
 {
-    auto& e = new_element(name, sname,
-        static_cast<string_view>(value));
-    auto const before =
-        set_.upper_bound(sname, key_compare{});
-    if(before == set_.begin())
-    {
-        BOOST_ASSERT(count(sname) == 0);
-        set_.insert_before(before, e);
-        list_.push_back(e);
-        return;
-    }
-    auto const last = std::prev(before);
-    // VFALCO is it worth comparing `field name` first?
-    if(! beast::iequals(sname, last->name_string()))
-    {
-        BOOST_ASSERT(count(sname) == 0);
-        set_.insert_before(before, e);
-        list_.push_back(e);
-        return;
-    }
-    // keep duplicate fields together in the list
-    set_.insert_before(before, e);
-    list_.insert(++list_.iterator_to(*last), e);
+    insert_element(
+        new_element(name, sname, value));
 }
 
 template<class Allocator>
 void
 basic_fields<Allocator>::
-set(field name, string_view const& value)
+set(field name, string_view value)
 {
     BOOST_ASSERT(name != field::unknown);
-    set_element(new_element(name, to_string(name),
-        static_cast<string_view>(value)));
+    set_element(
+        new_element(name, to_string(name), value));
 }
 
 template<class Allocator>
 void
 basic_fields<Allocator>::
-set(string_view sname, string_view const& value)
+set(string_view sname, string_view value)
 {
     set_element(new_element(
         string_to_field(sname), sname, value));
@@ -653,8 +641,7 @@ void
 basic_fields<Allocator>::
 swap(basic_fields<Allocator>& other)
 {
-    swap(other, std::integral_constant<bool,
-        alloc_traits::propagate_on_container_swap::value>{});
+    swap(other, pocs{});
 }
 
 template<class Allocator>
@@ -671,6 +658,24 @@ swap(
 // Lookup
 //
 //------------------------------------------------------------------------------
+
+template<class Allocator>
+inline
+bool
+basic_fields<Allocator>::
+contains(field name) const
+{
+    BOOST_ASSERT(name != field::unknown);
+    return contains(to_string(name));
+}
+
+template<class Allocator>
+bool
+basic_fields<Allocator>::
+contains(string_view name) const
+{
+    return find(name) != end();
+}
 
 template<class Allocator>
 inline
@@ -740,6 +745,21 @@ equal_range(string_view name) const ->
         ++list_.iterator_to(*(--result.second))};
 }
 
+template<class Allocator>
+auto
+basic_fields<Allocator>::
+find_last(field name) const ->
+    const_iterator
+{
+    BOOST_ASSERT(name != field::unknown);
+    auto const result = set_.equal_range(
+        to_string(name), key_compare{});
+    if(result.first == result.second)
+        return list_.end();
+    return list_.iterator_to(
+        *std::prev(result.second));
+}
+
 //------------------------------------------------------------------------------
 
 namespace detail {
@@ -756,10 +776,11 @@ struct iequals_predicate
     string_view sv2;
 };
 
-// Filter the last item in a token list
+// Append the non-matching items of a token
+// list to s, as a comma separated list
 BOOST_BEAST_DECL
 void
-filter_token_list_last(
+filter_token_list(
     beast::detail::temporary_buffer& s,
     string_view value,
     iequals_predicate const& pred);
@@ -812,16 +833,10 @@ bool
 basic_fields<Allocator>::
 get_chunked_impl() const
 {
-    auto const te = token_list{
-        (*this)[field::transfer_encoding]};
-    for(auto it = te.begin(); it != te.end();)
-    {
-        auto const next = std::next(it);
-        if(next == te.end())
-            return beast::iequals(*it, "chunked");
-        it = next;
-    }
-    return false;
+    auto const it = find_last(field::transfer_encoding);
+    if(it == end())
+        return false;
+    return detail::is_chunked_coding(it->value());
 }
 
 template<class Allocator>
@@ -848,7 +863,7 @@ bool
 basic_fields<Allocator>::
 has_content_length_impl() const
 {
-    return count(field::content_length) > 0;
+    return contains(field::content_length);
 }
 
 template<class Allocator>
@@ -885,42 +900,55 @@ void
 basic_fields<Allocator>::
 set_chunked_impl(bool value)
 {
-    beast::detail::temporary_buffer buf;
-    auto it = find(field::transfer_encoding);
     if(value)
     {
         // append "chunked"
-        if(it == end())
+        auto const range = equal_range(field::transfer_encoding);
+        if(range.first == range.second)
         {
             set(field::transfer_encoding, "chunked");
             return;
         }
-        auto const te = token_list{it->value()};
-        for(auto itt = te.begin();;)
+        if(std::next(range.first) == range.second &&
+            detail::is_chunked_coding(range.first->value()))
+            return; // already set
+        // combine repeated fields into one list,
+        // removing any "chunked" tokens
+        beast::detail::temporary_buffer buf;
+        for(auto it = range.first; it != range.second; ++it)
+            detail::filter_token_list(
+                buf, it->value(), {"chunked", {}});
+        if(buf.empty())
         {
-            auto const next = std::next(itt);
-            if(next == te.end())
-            {
-                if(beast::iequals(*itt, "chunked"))
-                    return; // already set
-                break;
-            }
-            itt = next;
+            set(field::transfer_encoding, "chunked");
+            return;
         }
-
-        buf.append(it->value(), ", chunked");
+        buf.append(", chunked");
         set(field::transfer_encoding, buf.view());
         return;
     }
-    // filter "chunked"
-    if(it == end())
+    // remove "chunked"
+    auto const range = equal_range(field::transfer_encoding);
+    if(range.first == range.second)
         return;
-
-    detail::filter_token_list_last(buf, it->value(), {"chunked", {}});
-    if(! buf.empty())
-        set(field::transfer_encoding, buf.view());
-    else
+    string_view last;
+    for(auto const& s : token_list{
+            std::prev(range.second)->value()})
+        last = s;
+    if(! beast::iequals(last, "chunked"))
+        return;
+    // combine repeated fields into one list,
+    // removing any "chunked" tokens
+    beast::detail::temporary_buffer buf;
+    for(auto it = range.first; it != range.second; ++it)
+        detail::filter_token_list(
+            buf, it->value(), {"chunked", {}});
+    if(buf.empty())
+    {
         erase(field::transfer_encoding);
+        return;
+    }
+    set(field::transfer_encoding, buf.view());
 }
 
 template<class Allocator>
@@ -933,8 +961,9 @@ set_content_length_impl(
         erase(field::content_length);
     else
     {
+        auto s = to_static_string(*value);
         set(field::content_length,
-            to_static_string(*value));
+            to_string_view(s));
     }
 }
 
@@ -959,18 +988,22 @@ set_keep_alive_impl(
 template<class Allocator>
 auto
 basic_fields<Allocator>::
-new_element(field name,
-    string_view sname, string_view value) ->
-        element&
+try_create_new_element(
+    field name,
+    string_view sname,
+    string_view value,
+    error_code& ec) -> element*
 {
-    if(sname.size() + 2 >
-            (std::numeric_limits<off_t>::max)())
-        BOOST_THROW_EXCEPTION(std::length_error{
-            "field name too large"});
-    if(value.size() + 2 >
-            (std::numeric_limits<off_t>::max)())
-        BOOST_THROW_EXCEPTION(std::length_error{
-            "field value too large"});
+    if(sname.size() > max_name_size)
+    {
+        BOOST_BEAST_ASSIGN_EC(ec, error::header_field_name_too_large);
+        return nullptr;
+    }
+    if(value.size() > max_value_size)
+    {
+        BOOST_BEAST_ASSIGN_EC(ec, error::header_field_value_too_large);
+        return nullptr;
+    }
     value = detail::trim(value);
     std::uint16_t const off =
         static_cast<off_t>(sname.size() + 2);
@@ -980,7 +1013,50 @@ new_element(field name,
     auto const p = alloc_traits::allocate(a,
         (sizeof(element) + off + len + 2 + sizeof(align_type) - 1) /
             sizeof(align_type));
-    return *(::new(p) element(name, sname, value));
+    return ::new(p) element(name, sname, value);
+}
+
+template<class Allocator>
+auto
+basic_fields<Allocator>::
+new_element(
+    field name,
+    string_view sname,
+    string_view value) -> element&
+{
+    error_code ec;
+    auto* e = try_create_new_element(name, sname, value, ec);
+    if(ec.failed())
+        BOOST_THROW_EXCEPTION(system_error{ec});
+    return *e;
+}
+
+template<class Allocator>
+void
+basic_fields<Allocator>::
+insert_element(element& e)
+{
+    auto const before =
+        set_.upper_bound(e.name_string(), key_compare{});
+    if(before == set_.begin())
+    {
+        BOOST_ASSERT(! contains(e.name_string()));
+        set_.insert_before(before, e);
+        list_.push_back(e);
+        return;
+    }
+    auto const last = std::prev(before);
+    // VFALCO is it worth comparing `field name` first?
+    if(! beast::iequals(e.name_string(), last->name_string()))
+    {
+        BOOST_ASSERT(! contains(e.name_string()));
+        set_.insert_before(before, e);
+        list_.push_back(e);
+        return;
+    }
+    // keep duplicate fields together in the list
+    set_.insert_before(before, e);
+    list_.insert(++list_.iterator_to(*last), e);
 }
 
 template<class Allocator>
@@ -1123,13 +1199,13 @@ basic_fields<Allocator>::
 move_assign(basic_fields& other, std::true_type)
 {
     clear_all();
+    this->get() = std::move(other.get());
     set_ = std::move(other.set_);
     list_ = std::move(other.list_);
     method_ = other.method_;
     target_or_reason_ = other.target_or_reason_;
     other.method_ = {};
     other.target_or_reason_ = {};
-    this->get() = other.get();
 }
 
 template<class Allocator>

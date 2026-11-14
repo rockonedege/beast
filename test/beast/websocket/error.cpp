@@ -35,6 +35,9 @@ public:
         BEAST_EXPECT(ec.category().name() != nullptr);
         BEAST_EXPECT(! ec.message().empty());
         BEAST_EXPECT(ec == c);
+
+        BEAST_EXPECT(ec.message() != "");
+        BEAST_EXPECT(make_error_condition(c).message() != "");
     }
 
     void run() override
@@ -72,6 +75,7 @@ public:
         check(condition::handshake_failed, error::no_sec_accept);
         check(condition::handshake_failed, error::bad_sec_accept);
         check(condition::handshake_failed, error::upgrade_declined);
+        check(condition::handshake_failed, error::bad_sec_extensions);
     }
 };
 

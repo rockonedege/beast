@@ -13,6 +13,7 @@
 #include "stream_tests.hpp"
 
 #include <boost/beast/_experimental/unit_test/suite.hpp>
+#include <boost/beast/core/bind_handler.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/core/stream_traits.hpp>
 #include <boost/beast/core/string.hpp>
@@ -23,6 +24,7 @@
 #include <boost/beast/http/string_body.hpp>
 #include <boost/beast/http/write.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/write.hpp>
@@ -551,13 +553,10 @@ public:
             // stream destroyed
             test_server srv("", ep, log);
             {
-                stream_type s(ioc);
+                auto s = net::detached.as_default_on(stream_type(ioc));
                 s.socket().connect(srv.local_endpoint());
                 s.expires_after(std::chrono::seconds(0));
-                s.async_read_some(mb,
-                    [](error_code, std::size_t)
-                    {
-                    });
+                s.async_read_some(mb);
             }
             ioc.run();
             ioc.restart();
@@ -566,12 +565,9 @@ public:
         {
             // stale timer
             test_acceptor a;
-            stream_type s(ioc);
+            auto s = net::detached.as_default_on(stream_type(ioc));
             s.expires_after(std::chrono::milliseconds(50));
-            s.async_read_some(mb,
-                [](error_code, std::size_t)
-                {
-                });
+            s.async_read_some(mb);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(100));
             ioc.run();
@@ -656,6 +652,17 @@ public:
             s.expires_after(std::chrono::seconds(0));
             s.async_write_some(net::const_buffer{},
                 handler(error::timeout, 0));
+            ioc.run();
+            ioc.restart();
+        }
+
+        {
+            // non-empty buffer, timeout
+            test_server srv("*", ep, log);
+            stream_type s(ioc);
+            s.socket().connect(srv.local_endpoint());
+            s.expires_after(std::chrono::seconds(0));
+            s.async_write_some(cb, handler(error::timeout, 0));
             ioc.run();
             ioc.restart();
         }
@@ -1260,7 +1267,7 @@ public:
                 net::strand<
                     net::io_context::executor_type>,
                 unlimited_rate_policy> stream(std::move(sock));
-            BOOST_STATIC_ASSERT(
+            BOOST_CORE_STATIC_ASSERT(
                 std::is_convertible<
                     decltype(sock)::executor_type,
                     decltype(stream)::executor_type>::value);
@@ -1303,7 +1310,7 @@ public:
                 resolve_results.begin()->endpoint(),
                 net::use_awaitable))>);
 
-        auto comparison_function = [](error_code&, net::ip::tcp::endpoint) { return true; };
+        auto comparison_function = [](error_code const&, net::ip::tcp::endpoint) { return true; };
 
         static_assert(std::is_same_v<
             net::awaitable<net::ip::tcp::resolver::results_type::const_iterator>, decltype(

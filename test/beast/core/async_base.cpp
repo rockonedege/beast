@@ -17,6 +17,8 @@
 #include <boost/beast/_experimental/test/stream.hpp>
 #include <boost/beast/core/error.hpp>
 #include <boost/asio/async_result.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/coroutine.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -44,7 +46,7 @@ struct ex1_type
 {
 
     net::execution_context &
-    query(net::execution::context_t c) const noexcept
+    query(net::execution::context_t) const noexcept
     { return *reinterpret_cast<net::execution_context *>(&ex1ctx); }
 
     net::execution::blocking_t
@@ -52,23 +54,23 @@ struct ex1_type
     { return net::execution::blocking; };
 
     net::execution::outstanding_work_t
-    query(net::execution::outstanding_work_t w) const noexcept
+    query(net::execution::outstanding_work_t) const noexcept
     { return net::execution::outstanding_work; }
 
     ex1_type
-    require(net::execution::blocking_t::possibly_t b) const
+    require(net::execution::blocking_t::possibly_t) const
     { return *this; }
 
     ex1_type
-    require(net::execution::blocking_t::never_t b) const
+    require(net::execution::blocking_t::never_t) const
     { return *this; };
 
     ex1_type
-    prefer(net::execution::outstanding_work_t::untracked_t w) const
+    prefer(net::execution::outstanding_work_t::untracked_t) const
     { return *this; };
 
     ex1_type
-    prefer(net::execution::outstanding_work_t::tracked_t w) const
+    prefer(net::execution::outstanding_work_t::tracked_t) const
     { return *this; };
 
     template<class F>
@@ -83,7 +85,7 @@ struct ex1_type
     operator!=(ex1_type const &) const noexcept
     { return false; }
 };
-BOOST_STATIC_ASSERT(net::execution::is_executor<ex1_type>::value);
+BOOST_CORE_STATIC_ASSERT(net::execution::is_executor<ex1_type>::value);
 #else
 struct ex1_type
 {
@@ -94,7 +96,7 @@ struct ex1_type
     template<class F> void post(F&&) {}
     template<class F> void defer(F&&) {}
 };
-BOOST_STATIC_ASSERT(net::is_executor<ex1_type>::value);
+BOOST_CORE_STATIC_ASSERT(net::is_executor<ex1_type>::value);
 #endif
 
 
@@ -107,6 +109,11 @@ struct nested_alloc
     struct allocator_type
     {
     };
+
+    allocator_type get_allocator() const noexcept
+    {
+        return allocator_type{};
+    }
 };
 
 struct intrusive_alloc
@@ -114,11 +121,21 @@ struct intrusive_alloc
     struct allocator_type
     {
     };
+
+    allocator_type get_allocator() const noexcept
+    {
+        return allocator_type{};
+    }
 };
 
 struct no_ex
 {
     using executor_type = net::system_executor;
+
+    executor_type get_executor() const noexcept
+    {
+        return executor_type{};
+    }
 };
 
 struct nested_ex
@@ -126,6 +143,11 @@ struct nested_ex
     struct executor_type
     {
     };
+
+    executor_type get_executor() const noexcept
+    {
+        return executor_type{};
+    }
 };
 
 struct intrusive_ex
@@ -133,6 +155,11 @@ struct intrusive_ex
     struct executor_type
     {
     };
+
+    executor_type get_executor() const noexcept
+    {
+        return executor_type{};
+    }
 };
 
 template<class E, class A>
@@ -226,7 +253,7 @@ class async_base_test : public beast::unit_test::suite
 public:
     // no associated allocator
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             std::allocator<void>,
             net::associated_allocator_t<
@@ -235,7 +262,7 @@ public:
                     net::io_context::executor_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             std::allocator<int>,
             net::associated_allocator_t<
@@ -245,7 +272,7 @@ public:
                     std::allocator<int>>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             std::allocator<void>,
             net::associated_allocator_t<
@@ -255,7 +282,7 @@ public:
                 std::allocator<int> // ignored
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             std::allocator<int>,
             net::associated_allocator_t<
@@ -268,7 +295,7 @@ public:
 
     // nested associated allocator
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_alloc::allocator_type,
             net::associated_allocator_t<
@@ -277,7 +304,7 @@ public:
                     net::io_context::executor_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_alloc::allocator_type,
             net::associated_allocator_t<
@@ -287,7 +314,7 @@ public:
                     std::allocator<int>> // ignored
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_alloc::allocator_type,
             net::associated_allocator_t<
@@ -297,7 +324,7 @@ public:
                 std::allocator<int> // ignored
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_alloc::allocator_type,
             net::associated_allocator_t<
@@ -310,7 +337,7 @@ public:
 
     // intrusive associated allocator
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_alloc::allocator_type,
             net::associated_allocator_t<
@@ -319,7 +346,7 @@ public:
                     net::io_context::executor_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_alloc::allocator_type,
             net::associated_allocator_t<
@@ -329,7 +356,7 @@ public:
                     std::allocator<int>> // ignored
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_alloc::allocator_type,
             net::associated_allocator_t<
@@ -339,7 +366,7 @@ public:
                 std::allocator<int> // ignored
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_alloc::allocator_type,
             net::associated_allocator_t<
@@ -352,7 +379,7 @@ public:
 
     // no associated executor
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             ex1_type,
             net::associated_executor_t<
@@ -361,7 +388,7 @@ public:
                     ex1_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             ex1_type,
             net::associated_executor_t<
@@ -373,7 +400,7 @@ public:
 
     // nested associated executor
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_ex::executor_type,
             net::associated_executor_t<
@@ -382,7 +409,7 @@ public:
                     ex1_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             nested_ex::executor_type,
             net::associated_executor_t<
@@ -394,7 +421,7 @@ public:
 
     // intrusive associated executor
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_ex::executor_type,
             net::associated_executor_t<
@@ -403,7 +430,7 @@ public:
                     ex1_type>
         >>::value);
 
-    BOOST_STATIC_ASSERT(
+    BOOST_CORE_STATIC_ASSERT(
         std::is_same<
             intrusive_ex::executor_type,
             net::associated_executor_t<
@@ -503,6 +530,52 @@ public:
             op.complete_now();
         }
 
+        // cancellation
+        {
+            using handler_type = net::cancellation_slot_binder<
+                final_handler, net::cancellation_slot>;
+            bool invoked = false;
+            net::cancellation_signal sig;
+            async_base<handler_type, simple_executor> op(
+                net::bind_cancellation_slot(
+                    sig.slot(), final_handler{invoked}), {});
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::none);
+
+            // only the allowed types are recorded, even
+            // when nothing is connected to the slot
+            sig.emit(net::cancellation_type::total);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::none);
+            sig.emit(net::cancellation_type::terminal);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::terminal);
+
+            // the record is the most recent emission
+            sig.emit(net::cancellation_type::total);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::none);
+
+            // an intermediate operation connected to the
+            // slot receives the allowed types
+            auto received = net::cancellation_type::none;
+            op.get_cancellation_slot().assign(
+                [&](net::cancellation_type t){ received = t; });
+            sig.emit(net::cancellation_type::total);
+            BEAST_EXPECT(received == net::cancellation_type::none);
+            sig.emit(net::cancellation_type::terminal);
+            BEAST_EXPECT(received == net::cancellation_type::terminal);
+            // changing the allowed types discards the record
+            // and disconnects what was connected to the slot
+            op.set_allowed_cancellation(net::cancellation_type::all);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::none);
+            received = net::cancellation_type::none;
+            sig.emit(net::cancellation_type::terminal);
+            BEAST_EXPECT(received == net::cancellation_type::none);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::terminal);
+            op.get_cancellation_slot().assign(
+                [&](net::cancellation_type t){ received = t; });
+            sig.emit(net::cancellation_type::total);
+            BEAST_EXPECT(received == net::cancellation_type::total);
+            BEAST_EXPECT(op.cancelled() == net::cancellation_type::total);
+        }
+
         // legacy hooks
         legacy_handler::test(
             [](legacy_handler h)
@@ -571,7 +644,7 @@ public:
                     ioc1.get_executor());
             op->complete(false);
             delete op;
-            BEAST_EXPECT(ioc1.run() == 0);
+            BEAST_EXPECT(ioc1.run() == 1);
             BEAST_EXPECT(ioc2.run() == 1);
         }
         {
@@ -619,10 +692,12 @@ public:
         {
             struct throwing_data
             {
+                volatile bool always = true;
+
                 throwing_data()
                 {
-                    BOOST_THROW_EXCEPTION(
-                        std::exception{});
+                    if(always)
+                        BOOST_THROW_EXCEPTION(std::exception{});
                 }
             };
             stable_async_base<

@@ -11,16 +11,18 @@
 #define BOOST_BEAST_CORE_ASYNC_BASE_HPP
 
 #include <boost/beast/core/detail/config.hpp>
-#include <boost/beast/core/bind_handler.hpp>
 #include <boost/beast/core/detail/allocator.hpp>
 #include <boost/beast/core/detail/async_base.hpp>
-#include <boost/beast/core/detail/work_guard.hpp>
+#include <boost/asio/append.hpp>
 #include <boost/asio/associated_allocator.hpp>
+#include <boost/asio/associated_cancellation_slot.hpp>
 #include <boost/asio/associated_executor.hpp>
+#include <boost/asio/associated_immediate_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
-#include <boost/asio/handler_alloc_hook.hpp>
+#include <boost/asio/cancellation_state.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/handler_continuation_hook.hpp>
-#include <boost/asio/handler_invoke_hook.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/core/exchange.hpp>
 #include <boost/core/empty_value.hpp>
@@ -28,6 +30,7 @@
 
 namespace boost {
 namespace beast {
+
 
 /** Base class to assist writing composed operations.
 
@@ -59,11 +62,7 @@ namespace beast {
         shall be maintained until either the final handler is invoked, or the
         operation base is destroyed, whichever comes first.
 
-    @li Calls to the legacy customization points
-        `asio_handler_invoke`,
-        `asio_handler_allocate`,
-        `asio_handler_deallocate`, and
-        `asio_handler_is_continuation`,
+    @li Calls to the legacy customization point `asio_handler_is_continuation`
         which use argument-dependent lookup, will be forwarded to the
         legacy customization points associated with the handler.
 
@@ -178,7 +177,8 @@ template<
 >
 class async_base
 #if ! BOOST_BEAST_DOXYGEN
-    : private boost::empty_value<Allocator>
+    : public detail::with_immediate_executor_type<Handler>
+    , private boost::empty_value<Allocator>
 #endif
 {
     static_assert(
@@ -186,15 +186,17 @@ class async_base
         "Executor type requirements not met");
 
     Handler h_;
-    detail::select_work_guard_t<Executor1> wg1_;
-
+    net::executor_work_guard<Executor1> wg1_;
+    net::cancellation_state st_{
+        net::get_associated_cancellation_slot(h_, net::cancellation_slot()),
+        detail::allowed_cancellation_filter{net::cancellation_type::terminal}};
 public:
     /** The type of executor associated with this object.
 
-    If a class derived from @ref async_base is a completion
+    If a class derived from @ref boost::beast::async_base is a completion
     handler, then the associated executor of the derived class will
     be this type.
-*/
+    */
     using executor_type =
 #if BOOST_BEAST_DOXYGEN
         __implementation_defined__;
@@ -202,11 +204,22 @@ public:
         typename
         net::associated_executor<
             Handler,
-            typename detail::select_work_guard_t<Executor1>::executor_type
+            typename net::executor_work_guard<Executor1>::executor_type
                 >::type;
 #endif
 
-private:
+    /** The type of the immediate executor associated with this object.
+
+    If a class derived from @ref boost::beast::async_base is a completion
+    handler, then the associated immediage executor of the derived class will
+    be this type.
+    */
+#if BOOST_BEAST_DOXYGEN
+    using immediate_executor_type =
+        __implementation_defined__;
+#endif
+
+  private:
 
     virtual
     void
@@ -249,7 +262,7 @@ public:
         Handler_&& handler,
         Executor1 const& ex1)
         : h_(std::forward<Handler_>(handler))
-        , wg1_(detail::make_work_guard(ex1))
+        , wg1_(ex1)
     {
     }
 
@@ -275,7 +288,7 @@ public:
 
     /** The type of allocator associated with this object.
 
-        If a class derived from @ref async_base is a completion
+        If a class derived from @ref boost::beast::async_base is a completion
         handler, then the associated allocator of the derived class will
         be this type.
     */
@@ -284,7 +297,7 @@ public:
 
     /** Returns the allocator associated with this object.
 
-        If a class derived from @ref async_base is a completion
+        If a class derived from @ref boost::beast::async_base is a completion
         handler, then the object returned from this function will be used
         as the associated allocator of the derived class.
     */
@@ -297,7 +310,7 @@ public:
 
     /** Returns the executor associated with this object.
 
-        If a class derived from @ref async_base is a completion
+        If a class derived from @ref boost::beast::async_base is a completion
         handler, then the object returned from this function will be used
         as the associated executor of the derived class.
     */
@@ -306,6 +319,88 @@ public:
     {
         return net::get_associated_executor(
             h_, wg1_.get_executor());
+    }
+
+    /** Returns the immediate executor associated with this handler.
+        If the handler has none it returns asios default immediate
+        executor based on the executor of the object.
+
+        If a class derived from @ref boost::beast::async_base is a completion
+        handler, then the object returned from this function will be used
+        as the associated immediate executor of the derived class.
+    */
+    net::associated_immediate_executor_t<
+        Handler,
+        typename net::executor_work_guard<Executor1>::executor_type>
+    get_immediate_executor() const noexcept
+    {
+        return net::get_associated_immediate_executor(
+            h_, wg1_.get_executor());
+    }
+
+
+    /** The type of cancellation_slot associated with this object.
+
+        If a class derived from @ref async_base is a completion
+        handler, then the associated cancellation_slot of the
+        derived class will be this type.
+    */
+    using cancellation_slot_type = net::cancellation_slot;
+
+    /** Returns the cancellation_slot associated with this object.
+
+        If a class derived from @ref async_base is a completion
+        handler, then the object returned from this function will be used
+        as the associated cancellation_slot of the derived class.
+
+        The slot belongs to a cancellation state attached to the slot
+        associated with the final completion handler. A cancellation
+        emitted there is filtered by the allowed types, recorded, and
+        forwarded to this slot. The record is available through
+        @ref cancelled even when no intermediate operation was
+        connected to receive it.
+    */
+    cancellation_slot_type
+    get_cancellation_slot() const noexcept
+    {
+        return st_.slot();
+    }
+
+    /** Returns the cancellation recorded for this operation.
+
+        The record is the allowed part of the most recent cancellation
+        emitted on the slot associated with the final completion handler,
+        and is discarded when the allowed types are set. A composed
+        operation should check it when it resumes, before starting
+        another intermediate operation, since a cancellation emitted
+        after the previous one completed had no intermediate operation
+        to cancel.
+
+        @return The allowed types of the most recent emission, or
+        `net::cancellation_type::none`.
+    */
+    net::cancellation_type
+    cancelled() const noexcept
+    {
+        return st_.cancelled();
+    }
+
+    /** Set the allowed cancellation types, default is `terminal`.
+
+        This replaces the cancellation state: the recorded types are
+        discarded, and anything connected to the slot returned by
+        @ref get_cancellation_slot is disconnected. It must not be
+        called while an intermediate operation is outstanding, and
+        the recorded types should be checked before calling it.
+    */
+    void
+    set_allowed_cancellation(
+        net::cancellation_type allowed_cancellation_types =
+            net::cancellation_type::terminal)
+    {
+        st_ = net::cancellation_state(
+            net::get_associated_cancellation_slot(h_, net::cancellation_slot()),
+            detail::allowed_cancellation_filter{allowed_cancellation_types});
     }
 
     /// Returns the handler associated with this object
@@ -332,16 +427,19 @@ public:
 
         This invokes the final completion handler with the specified
         arguments forwarded. It is undefined to call either of
-        @ref complete or @ref complete_now more than once.
+        @ref boost::beast::async_base::complete or
+        @ref boost::beast::async_base::complete_now more than once.
 
-        Any temporary objects allocated with @ref beast::allocate_stable will
+        Any temporary objects allocated with @ref boost::beast::allocate_stable will
         be automatically destroyed before the final completion handler
         is invoked.
 
         @param is_continuation If this value is `false`, then the
-        handler will be submitted to the executor using `net::post`.
+        handler will be submitted to the to the immediate executor using
+        `net::dispatch`. If the handler has no immediate executor,
+        this will submit to the executor via `net::post`.
         Otherwise the handler will be invoked as if by calling
-        @ref complete_now.
+        @ref boost::beast::async_base::complete_now.
 
         @param args A list of optional parameters to invoke the handler
         with. The completion handler must be invocable with the parameter
@@ -352,14 +450,13 @@ public:
     complete(bool is_continuation, Args&&... args)
     {
         this->before_invoke_hook();
+        st_.slot().clear();
         if(! is_continuation)
         {
-            auto const ex = get_executor();
-            net::post(net::bind_executor(
+            auto const ex = this->get_immediate_executor();
+            net::dispatch(
                 ex,
-                beast::bind_front_handler(
-                    std::move(h_),
-                    std::forward<Args>(args)...)));
+                net::append(std::move(h_), std::forward<Args>(args)...));
             wg1_.reset();
         }
         else
@@ -373,9 +470,9 @@ public:
 
         This invokes the final completion handler with the specified
         arguments forwarded. It is undefined to call either of
-        @ref complete or @ref complete_now more than once.
+        @ref boost::beast::async_base::complete or @ref boost::beast::async_base::complete_now more than once.
 
-        Any temporary objects allocated with @ref beast::allocate_stable will
+        Any temporary objects allocated with @ref boost::beast::allocate_stable will
         be automatically destroyed before the final completion handler
         is invoked.
 
@@ -388,6 +485,7 @@ public:
     complete_now(Args&&... args)
     {
         this->before_invoke_hook();
+        st_.slot().clear();
         wg1_.reset();
         h_(std::forward<Args>(args)...);
     }
@@ -433,13 +531,6 @@ public:
         shall be maintained until either the final handler is invoked, or the
         operation base is destroyed, whichever comes first.
 
-    @li Calls to the legacy customization points
-        `asio_handler_invoke`,
-        `asio_handler_allocate`,
-        `asio_handler_deallocate`, and
-        `asio_handler_is_continuation`,
-        which use argument-dependent lookup, will be forwarded to the
-        legacy customization points associated with the handler.
 
     Data members of composed operations implemented as completion handlers
     do not have stable addresses, as the composed operation object is move

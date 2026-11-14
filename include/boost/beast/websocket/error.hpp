@@ -17,7 +17,7 @@ namespace boost {
 namespace beast {
 namespace websocket {
 
-/// Error codes returned from @ref beast::websocket::stream operations.
+/// Error codes returned from @ref boost::beast::websocket::stream operations.
 enum class error
 {
     /** The WebSocket stream was gracefully closed at both endpoints
@@ -139,6 +139,12 @@ enum class error
         Error codes with this value will compare equal to @ref condition::handshake_failed
     */
     upgrade_declined,
+
+    /** The WebSocket handshake Sec-WebSocket-Extensions field is invalid
+
+        Error codes with this value will compare equal to @ref condition::handshake_failed
+    */
+    bad_sec_extensions,
 
     //
     // Protocol errors

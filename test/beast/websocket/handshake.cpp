@@ -136,6 +136,61 @@ public:
             }
             ts.close();
         });
+
+        // handshake, deflate, supported
+        doStreamLoop([&](test::stream &ts)
+        {
+            echo_server es{log};
+            ws_type ws{ts};
+            ws.next_layer().connect(es.stream());
+            response_type res;
+            try
+            {
+                websocket::permessage_deflate option{};
+                option.client_enable = true;
+                option.client_max_window_bits = 14;
+                ws.set_option(option);
+
+                w.handshake(ws, res, "localhost", "/");
+
+                websocket::permessage_deflate_status status;
+                ws.get_status(status);
+                BEAST_EXPECT(status.active);
+                BEAST_EXPECT(9 == status.server_window_bits);
+                BEAST_EXPECT(14 == status.client_window_bits);
+            }
+            catch(...)
+            {
+                ts.close();
+                throw;
+            }
+            ts.close(); 
+        });
+
+        // handshake, deflate, not supported
+        doStreamLoop([&](test::stream &ts)
+        {
+            echo_server es{log};
+            ws_type_t<false> ws{ts};
+            ws.next_layer().connect(es.stream());
+            response_type res;
+            try
+            {
+                w.handshake(ws, res, "localhost", "/");
+
+                websocket::permessage_deflate_status status;
+                ws.get_status(status);
+                BEAST_EXPECT(!status.active);
+                BEAST_EXPECT(0 == status.server_window_bits);
+                BEAST_EXPECT(0 == status.client_window_bits);
+            }
+            catch(...)
+            {
+                ts.close();
+                throw;
+            }
+            ts.close();
+        });
     }
 
     void
@@ -340,6 +395,149 @@ public:
         reject("permessage-deflate; unknown=\"xy\"");
     }
 
+    // The client must validate the server's permessage-deflate response
+    // against its own offer: reject a sliding window larger than offered, a
+    // response-invalid parameter form, an extension it never offered, or a
+    // malformed response (rfc6455 4.1 step 5, rfc7692 5/7/7.1.2.1/7.1.2.2).
+    void
+    testExtResponseWindow()
+    {
+        // Drive a client handshake against a hand-crafted server response
+        // carrying `ext`, and return the resulting error_code. The
+        // negotiated permessage-deflate state is left in `status`.
+        permessage_deflate_status status;
+        auto const handshake_with =
+        [&](int server_max_window_bits,
+            int client_max_window_bits,
+            string_view ext,
+            bool client_enable = true) -> error_code
+        {
+            net::io_context ioc;
+            stream<test::stream> ws{ioc};
+            test::stream srv{ioc};
+            test::connect(ws.next_layer(), srv);
+
+            permessage_deflate pd;
+            pd.client_enable = client_enable;
+            pd.server_max_window_bits = server_max_window_bits;
+            pd.client_max_window_bits = client_max_window_bits;
+            ws.set_option(pd);
+
+            error_code result;
+            ws.async_handshake("localhost", "/",
+                [&](error_code ec){ result = ec; });
+
+            flat_buffer buf;
+            http::request<http::empty_body> req;
+            std::string resp;
+            http::async_read(srv, buf, req,
+                [&](error_code ec, std::size_t)
+                {
+                    BEAST_EXPECTS(! ec, ec.message());
+                    detail::sec_ws_accept_type acc;
+                    detail::make_sec_ws_accept(acc,
+                        req[http::field::sec_websocket_key]);
+                    resp =
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: upgrade\r\n"
+                        "Sec-WebSocket-Accept: " +
+                            std::string(to_string_view(acc)) + "\r\n"
+                        "Sec-WebSocket-Extensions: " +
+                            std::string(ext) + "\r\n"
+                        "\r\n";
+                    net::async_write(srv, net::buffer(resp),
+                        [](error_code, std::size_t){});
+                });
+
+            ioc.run();
+            ws.get_status(status);
+            return result;
+        };
+
+        // server selects a larger server window than offered -> reject
+        BEAST_EXPECT(handshake_with(10, 15,
+            "permessage-deflate; server_max_window_bits=15") ==
+                error::bad_sec_extensions);
+
+        // server omits server_max_window_bits after an offer below 15
+        // (so the server uses 32 KiB > the offer) -> reject (rfc7692 7.1.2.1)
+        BEAST_EXPECT(handshake_with(10, 15,
+            "permessage-deflate") == error::bad_sec_extensions);
+
+        // server omits server_max_window_bits after the default offer of 15
+        // (32 KiB does not exceed the offer) -> accept
+        BEAST_EXPECT(! handshake_with(15, 15, "permessage-deflate"));
+        BEAST_EXPECT(status.active);
+
+        // server echoes a larger client window than offered -> accept and
+        // compress at the offered size (rfc7692 7.2.1: the offer is a hint;
+        // the smaller size conforms to the offer and the response alike)
+        BEAST_EXPECT(! handshake_with(15, 10,
+            "permessage-deflate; client_max_window_bits=15"));
+        BEAST_EXPECT(status.active);
+        BEAST_EXPECT(status.client_window_bits == 10);
+
+        // server omits client_max_window_bits -> accept, we keep our own
+        // offered hint (rfc7692 7.1.2.2)
+        BEAST_EXPECT(! handshake_with(15, 10, "permessage-deflate"));
+        BEAST_EXPECT(status.active);
+        BEAST_EXPECT(status.client_window_bits == 10);
+
+        // client_max_window_bits is present with no value, which is only
+        // valid in an offer, not a response -> reject (rfc7692 7.1.2.2)
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate; client_max_window_bits") ==
+                error::bad_sec_extensions);
+
+        // a client window of 8 is within the offer -> accept
+        // (open_pmd compresses with a 9-bit window)
+        BEAST_EXPECT(! handshake_with(15, 15,
+            "permessage-deflate; client_max_window_bits=8"));
+        BEAST_EXPECT(status.client_window_bits == 8);
+
+        // permessage-deflate accepted although the client never offered it
+        // -> reject (rfc6455 4.1 step 5, rfc7692 5)
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate", false) == error::bad_sec_extensions);
+
+        // server selects windows within the offer -> accept
+        BEAST_EXPECT(! handshake_with(10, 10,
+            "permessage-deflate; server_max_window_bits=10;"
+            " client_max_window_bits=10"));
+        BEAST_EXPECT(status.server_window_bits == 10);
+        BEAST_EXPECT(status.client_window_bits == 10);
+
+        // a malformed accepting response: a parameter with an invalid
+        // value, a duplicate parameter, or a parameter not defined for
+        // use in a response -> reject (rfc7692 7)
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate; server_max_window_bits=16") ==
+                error::bad_sec_extensions);
+        BEAST_EXPECT(handshake_with(10, 15,
+            "permessage-deflate; server_max_window_bits") ==
+                error::bad_sec_extensions);
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate; client_max_window_bits=7") ==
+                error::bad_sec_extensions);
+        BEAST_EXPECT(handshake_with(10, 15,
+            "permessage-deflate; server_max_window_bits=10;"
+            " server_max_window_bits=10") ==
+                error::bad_sec_extensions);
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate; server_no_context_takeover=1") ==
+                error::bad_sec_extensions);
+        BEAST_EXPECT(handshake_with(15, 15,
+            "permessage-deflate; unknown=1") ==
+                error::bad_sec_extensions);
+
+        // a quoted value is valid (rfc7692 5.2) -> accept
+        BEAST_EXPECT(! handshake_with(10, 10,
+            "permessage-deflate; server_max_window_bits=\"10\";"
+            " client_max_window_bits=\"10\""));
+        BEAST_EXPECT(status.client_window_bits == 10);
+    }
+
     void
     testExtWrite()
     {
@@ -454,10 +652,10 @@ public:
             "permessage-deflate; server_max_window_bits=15",
             "permessage-deflate");
 
-        // minimum window size of 8 bits (a zlib bug)
+        // minimum window size of 8 bits
         accept(
             "permessage-deflate; server_max_window_bits=8",
-            "permessage-deflate; server_max_window_bits=9");
+            "permessage-deflate; server_max_window_bits=8");
 
         // non-default server_max_window_bits setting
         pmd.server_max_window_bits = 10;
@@ -465,17 +663,11 @@ public:
             "permessage-deflate",
             "permessage-deflate; server_max_window_bits=10");
 
-        // clamped server_max_window_bits setting #1
+        // clamped server_max_window_bits setting
         pmd.server_max_window_bits = 10;
         accept(
             "permessage-deflate; server_max_window_bits=14",
             "permessage-deflate; server_max_window_bits=10");
-
-        // clamped server_max_window_bits setting #2
-        pmd.server_max_window_bits=8;
-        accept(
-            "permessage-deflate; server_max_window_bits=14",
-            "permessage-deflate; server_max_window_bits=9");
 
         pmd.server_max_window_bits = 15;
 
@@ -725,10 +917,214 @@ public:
 #endif
 
     void
+    testIssue2364()
+    {
+        { // sync unauthorized
+            net::io_context ioc;
+            stream<test::stream> ws{ioc};
+            auto tr = connect(ws.next_layer());
+            std::string const reply =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "\r\n";
+            ws.next_layer().append(reply);
+            tr.close();
+            try
+            {
+                websocket::response_type response;
+                error_code ec;
+                ws.handshake(response, "localhost:80", "/", ec);
+                BEAST_EXPECT(ec);
+                BEAST_EXPECTS(response.result() == http::status::unauthorized,
+                                 std::to_string(response.result_int()));
+            }
+            catch(system_error const&)
+            {
+                fail();
+            }
+        }
+
+        { // sync invalid response
+            net::io_context ioc;
+            stream<test::stream> ws{ioc};
+            auto tr = connect(ws.next_layer());
+            std::string const reply =
+                    "zzzzzzzzzzzzzzzzzzzzz";
+            ws.next_layer().append(reply);
+            tr.close();
+            try
+            {
+                websocket::response_type response;
+                error_code ec;
+                ws.handshake(response, "localhost:80", "/", ec);
+                BEAST_EXPECT(ec);
+                BEAST_EXPECTS(response.result() == http::status::internal_server_error,
+                              std::to_string(response.result_int()));
+            }
+            catch(system_error const&)
+            {
+                fail();
+            }
+        }
+
+        { // async unauthorized
+            net::io_context ioc;
+            stream<test::stream> ws{ioc};
+            auto tr = connect(ws.next_layer());
+            std::string const reply =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "\r\n";
+            ws.next_layer().append(reply);
+            tr.close();
+            websocket::response_type response;
+            auto handler = [&](error_code ec)
+            {
+                BEAST_EXPECT(ec);
+                BEAST_EXPECTS(response.result() == http::status::unauthorized,
+                                  std::to_string(response.result_int()));
+            };
+            ws.async_handshake(response, "localhost:80", "/", handler);
+            ioc.run();
+        }
+
+        { // async invalid response
+            net::io_context ioc;
+            stream<test::stream> ws{ioc};
+            auto tr = connect(ws.next_layer());
+            std::string const reply =
+                    "zzzzzzzzzzzzzzzz";
+            ws.next_layer().append(reply);
+            tr.close();
+            websocket::response_type response;
+            auto handler = [&](error_code ec)
+            {
+                BEAST_EXPECT(ec);
+                BEAST_EXPECTS(response.result() == http::status::internal_server_error,
+                              std::to_string(response.result_int()));
+            };
+            ws.async_handshake(response, "localhost:80", "/", handler);
+            ioc.run();
+        }
+    }
+
+    void
+    testIssue3119()
+    {
+        // server_max_window_bits=8 is answered with 8, and the
+        // server's output fits a 256-byte inflate window.
+        net::io_context ioc;
+        stream<test::stream> wsc{ioc};
+        stream<test::stream> wss{ioc};
+        wsc.next_layer().connect(wss.next_layer());
+
+        permessage_deflate pmd;
+        pmd.client_enable = true;
+        pmd.server_enable = true;
+        wsc.set_option(pmd);
+        wss.set_option(pmd);
+
+        // permessage_deflate rejects 8, so offer it directly
+        wsc.set_option(stream_base::decorator(
+            [](request_type& req)
+            {
+                req.set(http::field::sec_websocket_extensions,
+                    "permessage-deflate; server_max_window_bits=8");
+            }));
+
+        response_type res;
+        wsc.async_handshake(res, "localhost", "/", test::success_handler());
+        wss.async_accept(test::success_handler());
+        ioc.run();
+
+        BEAST_EXPECT(res[http::field::sec_websocket_extensions] ==
+            "permessage-deflate; server_max_window_bits=8");
+        permessage_deflate_status status;
+        wss.get_status(status);
+        BEAST_EXPECT(status.active && status.server_window_bits == 8);
+        wsc.get_status(status);
+        BEAST_EXPECT(status.active && status.server_window_bits == 8);
+
+        // Repeats 300 bytes apart are out of reach of a 9-bit
+        // deflate window, whose longest distance is 250, but a
+        // 10-bit one would match across them, farther back than
+        // a 256-byte inflate window can follow.
+        std::string const block = random_string().substr(0, 300);
+        std::string s;
+        for(int i = 0; i < 16; ++i)
+            s += block;
+        wss.binary(true);
+        wss.write(net::buffer(s));
+
+        // Inflating one byte at a time resolves every match
+        // through the 256-byte window.
+        std::string got;
+        do
+        {
+            char c;
+            got.append(&c, wsc.read_some(net::buffer(&c, 1)));
+        }
+        while(! wsc.is_message_done());
+        BEAST_EXPECT(got == s);
+    }
+
+    void
+    testIssue2671()
+    {
+        std::string offered;
+        auto const offer_with =
+        [&](int server_max_window_bits,
+            int client_max_window_bits)
+        {
+            echo_server es{log};
+            stream<test::stream> ws{ioc_};
+            ws.next_layer().connect(es.stream());
+            permessage_deflate pd;
+            pd.client_enable = true;
+            pd.server_max_window_bits = server_max_window_bits;
+            pd.client_max_window_bits = client_max_window_bits;
+            ws.set_option(pd);
+            ws.set_option(stream_base::decorator(
+                [&offered](request_type& req)
+                {
+                    offered = std::string(
+                        req[http::field::sec_websocket_extensions]);
+                }));
+            ws.handshake("localhost", "/");
+            permessage_deflate_status status;
+            ws.get_status(status);
+            return status;
+        };
+
+        // the default of 15 is omitted from the offer; the server
+        // still selects its smaller window (rfc7692 7.1.2.1)
+        auto status = offer_with(15, 15);
+        BEAST_EXPECTS(offered ==
+            "permessage-deflate; client_max_window_bits", offered);
+        BEAST_EXPECT(status.active);
+        BEAST_EXPECT(status.server_window_bits == 9);
+        BEAST_EXPECT(status.client_window_bits == 15);
+
+        // a limit below the default is still offered
+        status = offer_with(10, 15);
+        BEAST_EXPECTS(offered ==
+            "permessage-deflate; server_max_window_bits=10;"
+            " client_max_window_bits", offered);
+        BEAST_EXPECT(status.active);
+        BEAST_EXPECT(status.server_window_bits == 9);
+
+        // a non-default client_max_window_bits is offered with a value
+        status = offer_with(15, 12);
+        BEAST_EXPECTS(offered ==
+            "permessage-deflate; client_max_window_bits=12", offered);
+        BEAST_EXPECT(status.active);
+        BEAST_EXPECT(status.client_window_bits == 12);
+    }
+
+    void
     run() override
     {
         testHandshake();
         testExtRead();
+        testExtResponseWindow();
         testExtWrite();
         testExtNegotiate();
         testMoveOnly();
@@ -737,6 +1133,9 @@ public:
 #if BOOST_ASIO_HAS_CO_AWAIT
         boost::ignore_unused(&handshake_test::testAwaitableCompiles);
 #endif
+        testIssue2364();
+        testIssue3119();
+        testIssue2671();
     }
 };
 

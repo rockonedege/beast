@@ -6,9 +6,10 @@
 //
 // Official repository: https://github.com/boostorg/beast
 //
-// This is a derivative work based on Zlib, copyright below:
+// This is a derivative work based on Zlib 1.3.2 (deflate.c, trees.c),
+// copyright below:
 /*
-    Copyright (C) 1995-2013 Jean-loup Gailly and Mark Adler
+    Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler
 
     This software is provided 'as-is', without any express or implied
     warranty.  In no event will the authors be held liable for any damages
@@ -42,8 +43,8 @@
 #include <boost/assert.hpp>
 #include <boost/config.hpp>
 #include <boost/make_unique.hpp>
-#include <boost/optional.hpp>
 #include <boost/throw_exception.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -96,7 +97,7 @@ namespace detail {
  *  REFERENCES
  *
  *      Deutsch, L.P.,"DEFLATE Compressed Data Format Specification".
- *      Available in http://tools.ietf.org/html/rfc1951
+ *      Available at https://datatracker.ietf.org/doc/html/rfc1951
  *
  *      A description of the Rabin and Karp algorithm is given in the book
  *         "Algorithms" by R. Sedgewick, Addison-Wesley, p252.
@@ -117,7 +118,7 @@ deflate_stream::
 gen_codes(ct_data *tree, int max_code, std::uint16_t *bl_count)
 {
     std::uint16_t next_code[maxBits+1]; /* next code value for each bit length */
-    std::uint16_t code = 0;              /* running code value */
+    unsigned code = 0;         /* running code value */
     int bits;                  /* bit index */
     int n;                     /* code index */
 
@@ -126,7 +127,7 @@ gen_codes(ct_data *tree, int max_code, std::uint16_t *bl_count)
     for(bits = 1; bits <= maxBits; bits++)
     {
         code = (code + bl_count[bits-1]) << 1;
-        next_code[bits] = code;
+        next_code[bits] = (std::uint16_t)code;
     }
     // Check that the bit counts in bl_count are consistent.
     // The last code must be all ones.
@@ -235,16 +236,16 @@ doReset(
     if(level == default_size)
         level = 6;
 
-    // VFALCO What do we do about this?
-    // until 256-byte window bug fixed
-    if(windowBits == 8)
-        windowBits = 9;
-
     if(level < 0 || level > 9)
         BOOST_THROW_EXCEPTION(std::invalid_argument{
             "invalid level"});
 
-    if(windowBits < 8 || windowBits > 15)
+    /*  deflate does not support a 256-byte window. With the zlib
+        wrapper, zlib silently uses a 512-byte window instead and
+        advertises it in the header, but a raw deflate stream has
+        no header, so zlib rejects windowBits == 8 for raw streams.
+    */
+    if(windowBits < 9 || windowBits > 15)
         BOOST_THROW_EXCEPTION(std::invalid_argument{
             "invalid windowBits"});
 
@@ -279,27 +280,61 @@ doClear()
     buf_.reset();
 }
 
+/*  For the default windowBits of 15 and memLevel of 8, this function returns a
+    close to exact, as well as small, upper bound on the compressed size. This
+    is an expansion of ~0.03%, plus a small constant.
+
+    For any setting other than those defaults for windowBits and memLevel, one
+    of two worst case bounds is returned. This is at most an expansion of ~4% or
+    ~13%, plus a small constant.
+
+    Both the 0.03% and 4% derive from the overhead of stored blocks. The first
+    one is for stored blocks of 16383 bytes (memLevel == 8), whereas the second
+    is for stored blocks of 127 bytes (the worst case memLevel == 1). The
+    expansion results from five bytes of header for each stored block.
+
+    The larger expansion of 13% results from a window size less than or equal to
+    the symbols buffer size (windowBits <= memLevel + 7). In that case some of
+    the data being compressed may have slid out of the sliding window, impeding
+    a stored block from being emitted. Then the only choice is a fixed or
+    dynamic block, where a fixed block limits the maximum expansion to 9 bits
+    per 8-bit byte, plus 10 bits for every block. The smallest block size for
+    which this can occur is 255 (memLevel == 2).
+
+    Shifts are used to approximate divisions, for speed.
+*/
 std::size_t
 deflate_stream::
 doUpperBound(std::size_t sourceLen) const
 {
-    std::size_t complen;
-    std::size_t wraplen;
+    std::size_t fixedlen, storelen, bound;
 
-    /* conservative upper bound for compressed data */
-    complen = sourceLen +
-              ((sourceLen + 7) >> 3) + ((sourceLen + 63) >> 6) + 5;
+    /* upper bound for fixed blocks with 9-bit literals and length 255
+       (memLevel == 2, which is the lowest that may not use stored blocks) --
+       ~13% overhead plus a small constant */
+    fixedlen = sourceLen + (sourceLen >> 3) + (sourceLen >> 8) +
+               (sourceLen >> 9) + 4;
+    if(fixedlen < sourceLen)
+        fixedlen = static_cast<std::size_t>(-1);
 
-    /* compute wrapper length */
-    wraplen = 0;
+    /* upper bound for stored blocks with length 127 (memLevel == 1) --
+       ~4% overhead plus a small constant */
+    storelen = sourceLen + (sourceLen >> 5) + (sourceLen >> 7) +
+               (sourceLen >> 11) + 7;
+    if(storelen < sourceLen)
+        storelen = static_cast<std::size_t>(-1);
 
-    /* if not default parameters, return conservative bound */
+    /* raw deflate: there is no wrapper */
+
+    /* if not default parameters, return one of the conservative bounds */
     if(w_bits_ != 15 || hash_bits_ != 8 + 7)
-        return complen + wraplen;
+        return w_bits_ <= hash_bits_ && level_ ? fixedlen : storelen;
 
-    /* default settings: return tight bound for that case */
-    return sourceLen + (sourceLen >> 12) + (sourceLen >> 14) +
-           (sourceLen >> 25) + 13 - 6 + wraplen;
+    /* default settings: return tight bound for that case -- ~0.03% overhead
+       plus a small constant */
+    bound = sourceLen + (sourceLen >> 12) + (sourceLen >> 14) +
+            (sourceLen >> 25) + 13 - 6;
+    return bound < sourceLen ? static_cast<std::size_t>(-1) : bound;
 }
 
 void
@@ -310,10 +345,12 @@ doTune(
     int nice_length,
     int max_chain)
 {
-    good_match_ = good_length;
+    maybe_init(); // lm_init() would otherwise overwrite these
+
+    good_match_ = (uInt)good_length;
+    max_lazy_match_ = (uInt)max_lazy;
     nice_match_ = nice_length;
-    max_lazy_match_ = max_lazy;
-    max_chain_length_ = max_chain;
+    max_chain_length_ = (uInt)max_chain;
 }
 
 void
@@ -322,25 +359,42 @@ doParams(z_params& zs, int level, Strategy strategy, error_code& ec)
 {
     compress_func func;
 
+    ec = {};
+    maybe_init();
+
     if(level == default_size)
         level = 6;
     if(level < 0 || level > 9)
     {
-        ec = error::stream_error;
+        BOOST_BEAST_ASSIGN_EC(ec, error::stream_error);
         return;
     }
     func = get_config(level_).func;
 
     if((strategy != strategy_ || func != get_config(level).func) &&
-        zs.total_in != 0)
+        last_flush_ != -2)
     {
         // Flush the last buffer:
         doWrite(zs, Flush::block, ec);
-        if(ec == error::need_buffers && pending_ == 0)
-            ec = {};
+        if(ec == error::stream_error)
+            return;
+        ec = {};
+        if(zs.avail_in || (strstart_ - block_start_) + lookahead_)
+        {
+            BOOST_BEAST_ASSIGN_EC(ec, error::need_buffers);
+            return;
+        }
     }
     if(level_ != level)
     {
+        if(level_ == 0 && matches_ != 0)
+        {
+            if(matches_ == 1)
+                slide_hash();
+            else
+                clear_hash();
+            matches_ = 0;
+        }
         level_ = level;
         max_lazy_match_   = get_config(level).max_lazy;
         good_match_       = get_config(level).good_length;
@@ -350,37 +404,30 @@ doParams(z_params& zs, int level, Strategy strategy, error_code& ec)
     strategy_ = strategy;
 }
 
-// VFALCO boost::optional param is a workaround for
-//        gcc "maybe uninitialized" warning
-//        https://github.com/boostorg/beast/issues/532
-//
 void
 deflate_stream::
-doWrite(z_params& zs, boost::optional<Flush> flush, error_code& ec)
+doWrite(z_params& zs, Flush flush, error_code& ec)
 {
+    ec = {};
     maybe_init();
 
-    if(zs.next_in == nullptr && zs.avail_in != 0)
-        BOOST_THROW_EXCEPTION(std::invalid_argument{"invalid input"});
-
-    if(zs.next_out == nullptr ||
-        (status_ == FINISH_STATE && flush != Flush::finish))
+    if(flush == Flush::trees ||
+        zs.next_out == nullptr ||
+        (zs.next_in == nullptr && zs.avail_in != 0) ||
+        (status_ == finish_state && flush != Flush::finish))
     {
-        ec = error::stream_error;
+        BOOST_BEAST_ASSIGN_EC(ec, error::stream_error);
         return;
     }
     if(zs.avail_out == 0)
     {
-        ec = error::need_buffers;
+        BOOST_BEAST_ASSIGN_EC(ec, error::need_buffers);
         return;
     }
 
     // value of flush param for previous deflate call
-    auto old_flush = boost::make_optional<Flush>(
-        last_flush_.is_initialized(),
-        last_flush_ ? *last_flush_ : Flush::none);
-
-    last_flush_ = flush;
+    int const old_flush = last_flush_;
+    last_flush_ = static_cast<int>(flush);
 
     // Flush as much pending output as possible
     if(pending_ != 0)
@@ -394,60 +441,50 @@ doWrite(z_params& zs, boost::optional<Flush> flush, error_code& ec)
              * but this is not an error situation so make sure we
              * return OK instead of BUF_ERROR at next call of deflate:
              */
-            last_flush_ = boost::none;
+            last_flush_ = -1;
             return;
         }
     }
-    else if(zs.avail_in == 0 && (
-            old_flush && flush <= *old_flush // Caution: depends on enum order
-        ) && flush != Flush::finish)
+    else if(zs.avail_in == 0 &&
+        static_cast<int>(flush) <= old_flush && // Caution: depends on enum order
+        flush != Flush::finish)
     {
         /* Make sure there is something to do and avoid duplicate consecutive
          * flushes. For repeated and useless calls with Flush::finish, we keep
          * returning Z_STREAM_END instead of Z_BUF_ERROR.
          */
-        ec = error::need_buffers;
+        BOOST_BEAST_ASSIGN_EC(ec, error::need_buffers);
         return;
     }
 
     // User must not provide more input after the first FINISH:
-    if(status_ == FINISH_STATE && zs.avail_in != 0)
+    if(status_ == finish_state && zs.avail_in != 0)
     {
-        ec = error::need_buffers;
+        BOOST_BEAST_ASSIGN_EC(ec, error::need_buffers);
         return;
     }
 
     /* Start a new block or continue the current one.
      */
     if(zs.avail_in != 0 || lookahead_ != 0 ||
-        (flush != Flush::none && status_ != FINISH_STATE))
+        (flush != Flush::none && status_ != finish_state))
     {
         block_state bstate;
 
-        switch(strategy_)
-        {
-        case Strategy::huffman:
-            bstate = deflate_huff(zs, flush.get());
-            break;
-        case Strategy::rle:
-            bstate = deflate_rle(zs, flush.get());
-            break;
-        default:
-        {
-            bstate = (this->*(get_config(level_).func))(zs, flush.get());
-            break;
-        }
-        }
+        bstate = level_ == 0 ? deflate_stored(zs, flush) :
+                 strategy_ == Strategy::huffman ? deflate_huff(zs, flush) :
+                 strategy_ == Strategy::rle ? deflate_rle(zs, flush) :
+                 (this->*(get_config(level_).func))(zs, flush);
 
         if(bstate == finish_started || bstate == finish_done)
         {
-            status_ = FINISH_STATE;
+            status_ = finish_state;
         }
         if(bstate == need_more || bstate == finish_started)
         {
             if(zs.avail_out == 0)
             {
-                last_flush_ = boost::none; /* avoid BUF_ERROR next call, see above */
+                last_flush_ = -1; /* avoid BUF_ERROR next call, see above */
             }
             return;
             /*  If flush != Flush::none && avail_out == 0, the next call
@@ -485,7 +522,7 @@ doWrite(z_params& zs, boost::optional<Flush> flush, error_code& ec)
             flush_pending(zs);
             if(zs.avail_out == 0)
             {
-                last_flush_ = boost::none; /* avoid BUF_ERROR at next call, see above */
+                last_flush_ = -1; /* avoid BUF_ERROR at next call, see above */
                 return;
             }
         }
@@ -493,75 +530,22 @@ doWrite(z_params& zs, boost::optional<Flush> flush, error_code& ec)
 
     if(flush == Flush::finish)
     {
-        ec = error::end_of_stream;
+        BOOST_BEAST_ASSIGN_EC(ec, error::end_of_stream);
         return;
     }
-}
-
-// VFALCO Warning: untested
-void
-deflate_stream::
-doDictionary(Byte const* dict, uInt dictLength, error_code& ec)
-{
-    if(lookahead_)
-    {
-        ec = error::stream_error;
-        return;
-    }
-
-    maybe_init();
-
-    /* if dict would fill window, just replace the history */
-    if(dictLength >= w_size_)
-    {
-        clear_hash();
-        strstart_ = 0;
-        block_start_ = 0L;
-        insert_ = 0;
-        dict += dictLength - w_size_;  /* use the tail */
-        dictLength = w_size_;
-    }
-
-    /* insert dict into window and hash */
-    z_params zs;
-    zs.avail_in = dictLength;
-    zs.next_in = (const Byte *)dict;
-    zs.avail_out = 0;
-    zs.next_out = 0;
-    fill_window(zs);
-    while(lookahead_ >= minMatch)
-    {
-        uInt str = strstart_;
-        uInt n = lookahead_ - (minMatch-1);
-        do
-        {
-            update_hash(ins_h_, window_[str + minMatch-1]);
-            prev_[str & w_mask_] = head_[ins_h_];
-            head_[ins_h_] = (std::uint16_t)str;
-            str++;
-        }
-        while(--n);
-        strstart_ = str;
-        lookahead_ = minMatch-1;
-        fill_window(zs);
-    }
-    strstart_ += lookahead_;
-    block_start_ = (long)strstart_;
-    insert_ = lookahead_;
-    lookahead_ = 0;
-    match_length_ = prev_length_ = minMatch-1;
-    match_available_ = 0;
 }
 
 void
 deflate_stream::
 doPrime(int bits, int value, error_code& ec)
 {
+    ec = {};
     maybe_init();
 
-    if((Byte *)(d_buf_) < pending_out_ + ((Buf_size + 7) >> 3))
+    if(bits < 0 || bits > 16 ||
+        sym_buf_ < pending_out_ + ((Buf_size + 7) >> 3))
     {
-        ec = error::need_buffers;
+        BOOST_BEAST_ASSIGN_EC(ec, error::need_buffers);
         return;
     }
 
@@ -583,6 +567,8 @@ void
 deflate_stream::
 doPending(unsigned* value, int* bits)
 {
+    maybe_init();
+
     if(value != 0)
         *value = pending_;
     if(bits != 0)
@@ -628,30 +614,61 @@ init()
     std::memset(prev_, 0, nprev);
     head_   = reinterpret_cast<std::uint16_t*>(buf_.get() + nwindow + nprev);
 
-    /*  We overlay pending_buf_ and d_buf_ + l_buf_. This works
-        since the average output size for(length, distance)
-        codes is <= 24 bits.
-    */
-    auto overlay = reinterpret_cast<std::uint16_t*>(
-        buf_.get() + nwindow + nprev + nhead);
-
     // nothing written to window_ yet
     high_water_ = 0;
 
-    pending_buf_ =
-        reinterpret_cast<std::uint8_t*>(overlay);
-    pending_buf_size_ =
-        static_cast<std::uint32_t>(lit_bufsize_) *
-            (sizeof(std::uint16_t) + 2L);
 
-    d_buf_ = overlay + lit_bufsize_ / sizeof(std::uint16_t);
-    l_buf_ = pending_buf_ + (1 + sizeof(std::uint16_t)) * lit_bufsize_;
+    /* We overlay pending_buf and sym_buf. This works since the average size
+       for length/distance pairs over any compressed block is assured to be 31
+       bits or less.
+
+       Analysis: The longest fixed codes are a length code of 8 bits plus 5
+       extra bits, for lengths 131 to 257. The longest fixed distance codes are
+       5 bits plus 13 extra bits, for distances 16385 to 32768. The longest
+       possible fixed-codes length/distance pair is then 31 bits total.
+
+       sym_buf starts one-fourth of the way into pending_buf. So there are
+       three bytes in sym_buf for every four bytes in pending_buf. Each symbol
+       in sym_buf is three bytes -- two for the distance and one for the
+       literal/length. As each symbol is consumed, the pointer to the next
+       sym_buf value to read moves forward three bytes. From that symbol, up to
+       31 bits are written to pending_buf. The closest the written pending_buf
+       bits gets to the next sym_buf symbol to read is just before the last
+       code is written. At that time, 31*(n-2) bits have been written, just
+       after 24*(n-2) bits have been consumed from sym_buf. sym_buf starts at
+       8*n bits into pending_buf. (Note that the symbol buffer fills when n-1
+       symbols are written.) The closest the writing gets to what is unread is
+       then n+14 bits. Here n is lit_bufsize, which is 16384 by default, and
+       can range from 128 to 32768.
+
+       Therefore, at a minimum, there are 142 bits of space between what is
+       written and what is read in the overlain buffers, so the symbols cannot
+       be overwritten by the compressed data. That space is actually 139 bits,
+       due to the three-bit fixed-code block header.
+
+       That covers the case where either Z_FIXED is specified, forcing fixed
+       codes, or when the use of fixed codes is chosen, because that choice
+       results in a smaller compressed block than dynamic codes. That latter
+       condition then assures that the above analysis also covers all dynamic
+       blocks. A dynamic-code block will only be chosen to be emitted if it has
+       fewer bits than a fixed-code block would for the same set of symbols.
+       Therefore its average symbol length is assured to be less than 31. So
+       the compressed data for a dynamic block also cannot overwrite the
+       symbols from which it is being constructed.
+     */
+    pending_buf_ =
+        buf_.get() + nwindow + nprev + nhead;
+    pending_buf_size_ =
+        static_cast<std::uint32_t>(lit_bufsize_) * 4;
+
+    sym_buf_ = pending_buf_ + lit_bufsize_;
+    sym_end_ = (lit_bufsize_ - 1) * 3;
 
     pending_ = 0;
     pending_out_ = pending_buf_;
 
-    status_ = BUSY_STATE;
-    last_flush_ = Flush::none;
+    status_ = busy_state;
+    last_flush_ = -2; // no call to write yet
 
     tr_init();
     lm_init();
@@ -698,10 +715,10 @@ init_block()
         dyn_dtree_[n].fc = 0;
     for(int n = 0; n < blCodes; n++)
         bl_tree_[n].fc = 0;
-    dyn_ltree_[END_BLOCK].fc = 1;
+    dyn_ltree_[end_block].fc = 1;
     opt_len_ = 0L;
     static_len_ = 0L;
-    last_lit_ = 0;
+    sym_next_ = 0;
     matches_ = 0;
 }
 
@@ -784,7 +801,7 @@ gen_bitlen(tree_desc *desc)
      */
     tree[heap_[heap_max_]].dl = 0; // root of the heap
 
-    for(h = heap_max_+1; h < HEAP_SIZE; h++) {
+    for(h = heap_max_+1; h < heap_size; h++) {
         n = heap_[h];
         bits = tree[tree[n].dl].dl + 1;
         if(bits > max_length) bits = max_length, overflow++;
@@ -837,7 +854,7 @@ gen_bitlen(tree_desc *desc)
                 continue;
             if((unsigned) tree[m].dl != (unsigned) bits)
             {
-                opt_len_ += ((long)bits - (long)tree[m].dl) *(long)tree[m].fc;
+                opt_len_ += ((std::uint32_t)bits - tree[m].dl) * tree[m].fc;
                 tree[m].dl = (std::uint16_t)bits;
             }
             n--;
@@ -868,7 +885,7 @@ build_tree(tree_desc *desc)
      * heap[0] is not used.
      */
     heap_len_ = 0;
-    heap_max_ = HEAP_SIZE;
+    heap_max_ = heap_size;
 
     for(n = 0; n < elems; n++)
     {
@@ -979,15 +996,15 @@ scan_tree(
         else if(curlen != 0)
         {
             if(curlen != prevlen) bl_tree_[curlen].fc++;
-                bl_tree_[REP_3_6].fc++;
+            bl_tree_[rep_3_6].fc++;
         }
         else if(count <= 10)
         {
-            bl_tree_[REPZ_3_10].fc++;
+            bl_tree_[repz_3_10].fc++;
         }
         else
         {
-            bl_tree_[REPZ_11_138].fc++;
+            bl_tree_[repz_11_138].fc++;
         }
         count = 0;
         prevlen = curlen;
@@ -1057,17 +1074,17 @@ send_tree(
                 count--;
             }
             BOOST_ASSERT(count >= 3 && count <= 6);
-            send_code(REP_3_6, bl_tree_);
+            send_code(rep_3_6, bl_tree_);
             send_bits(count-3, 2);
         }
         else if(count <= 10)
         {
-            send_code(REPZ_3_10, bl_tree_);
+            send_code(repz_3_10, bl_tree_);
             send_bits(count-3, 3);
         }
         else
         {
-            send_code(REPZ_11_138, bl_tree_);
+            send_code(repz_11_138, bl_tree_);
             send_bits(count-11, 7);
         }
         count = 0;
@@ -1158,16 +1175,17 @@ compress_block(
 {
     unsigned dist;      /* distance of matched string */
     int lc;             /* match length or unmatched char (if dist == 0) */
-    unsigned lx = 0;    /* running index in l_buf */
+    unsigned sx = 0;    /* running index in sym_buf */
     unsigned code;      /* the code to send */
     int extra;          /* number of extra bits to send */
 
-    if(last_lit_ != 0)
+    if(sym_next_ != 0)
     {
         do
         {
-            dist = d_buf_[lx];
-            lc = l_buf_[lx++];
+            dist = sym_buf_[sx++] & 0xff;
+            dist += (unsigned)(sym_buf_[sx++] & 0xff) << 8;
+            lc = sym_buf_[sx++];
             if(dist == 0)
             {
                 send_code(lc, ltree); /* send a literal byte */
@@ -1197,20 +1215,20 @@ compress_block(
             } /* literal or match pair ? */
 
             /* Check that the overlay between pending_buf and d_buf+l_buf is ok: */
-            BOOST_ASSERT((uInt)(pending_) < lit_bufsize_ + 2*lx);
+            BOOST_ASSERT((uInt)(pending_) < lit_bufsize_ + sx);
         }
-        while(lx < last_lit_);
+        while(sx < sym_next_);
     }
 
-    send_code(END_BLOCK, ltree);
+    send_code(end_block, ltree);
 }
 
 /*  Check if the data type is TEXT or BINARY, using the following algorithm:
     - TEXT if the two conditions below are satisfied:
         a) There are no non-portable control characters belonging to the
-            "black list" (0..6, 14..25, 28..31).
+            "block list" (0..6, 14..25, 28..31).
         b) There is at least one printable character belonging to the
-            "white list" (9 {TAB}, 10 {LF}, 13 {CR}, 32..255).
+            "allow list" (9 {TAB}, 10 {LF}, 13 {CR}, 32..255).
     - BINARY otherwise.
     - The following partially-portable control characters form a
         "gray list" that is ignored in this detection algorithm:
@@ -1221,19 +1239,19 @@ int
 deflate_stream::
 detect_data_type()
 {
-    /* black_mask is the bit mask of black-listed bytes
+    /* block_mask is the bit mask of block-listed bytes
      * set bits 0..6, 14..25, and 28..31
      * 0xf3ffc07f = binary 11110011111111111100000001111111
      */
-    unsigned long black_mask = 0xf3ffc07fUL;
+    unsigned long block_mask = 0xf3ffc07fUL;
     int n;
 
-    // Check for non-textual ("black-listed") bytes.
-    for(n = 0; n <= 31; n++, black_mask >>= 1)
-        if((black_mask & 1) && (dyn_ltree_[n].fc != 0))
+    // Check for non-textual ("block-listed") bytes.
+    for(n = 0; n <= 31; n++, block_mask >>= 1)
+        if((block_mask & 1) && (dyn_ltree_[n].fc != 0))
             return binary;
 
-    // Check for textual ("white-listed") bytes. */
+    // Check for textual ("allow-listed") bytes. */
     if(dyn_ltree_[9].fc != 0 || dyn_ltree_[10].fc != 0
             || dyn_ltree_[13].fc != 0)
         return text;
@@ -1241,7 +1259,7 @@ detect_data_type()
         if(dyn_ltree_[n].fc != 0)
             return text;
 
-    /* There are no "black-listed" or "white-listed" bytes:
+    /* There are no "block-listed" or "allow-listed" bytes:
      * this stream either is empty or has tolerated ("gray-listed") bytes only.
      */
     return binary;
@@ -1281,28 +1299,6 @@ bi_flush()
     }
 }
 
-/*  Copy a stored block, storing first the length and its
-    one's complement if requested.
-*/
-void
-deflate_stream::
-copy_block(
-    char    *buf,       // the input data
-    unsigned len,       // its length
-    int      header)    // true if block header must be written
-{
-    bi_windup();        // align on byte boundary
-
-    if(header)
-    {
-        put_short((std::uint16_t)len);
-        put_short((std::uint16_t)~len);
-    }
-    if(buf)
-        std::memcpy(&pending_buf_[pending_], buf, len);
-    pending_ += len;
-}
-
 //------------------------------------------------------------------------------
 
 /* Initialize the tree data structures for a new zlib stream.
@@ -1334,8 +1330,8 @@ void
 deflate_stream::
 tr_align()
 {
-    send_bits(STATIC_TREES<<1, 3);
-    send_code(END_BLOCK, lut_.ltree);
+    send_bits(static_trees<<1, 3);
+    send_code(end_block, lut_.ltree);
     bi_flush();
 }
 
@@ -1357,30 +1353,37 @@ tr_stored_block(
     std::uint32_t stored_len,   // length of input block
     int last)                   // one if this is the last block for a file
 {
-    send_bits((STORED_BLOCK<<1)+last, 3);       // send block type
-    copy_block(buf, (unsigned)stored_len, 1);   // with header
+    send_bits((stored_block<<1)+last, 3);       // send block type
+    bi_windup();                                // align on byte boundary
+    put_short(static_cast<std::uint16_t>(stored_len));
+    put_short(static_cast<std::uint16_t>(~stored_len));
+    if(stored_len)
+        std::memcpy(&pending_buf_[pending_], buf, stored_len);
+    pending_ += stored_len;
 }
 
 void
 deflate_stream::
 tr_tally_dist(std::uint16_t dist, std::uint8_t len, bool& flush)
 {
-    d_buf_[last_lit_] = dist;
-    l_buf_[last_lit_++] = len;
+    sym_buf_[sym_next_++] = dist & 0xFF;
+    sym_buf_[sym_next_++] = dist >> 8;
+    sym_buf_[sym_next_++] = len;
     dist--;
     dyn_ltree_[lut_.length_code[len]+literals+1].fc++;
     dyn_dtree_[d_code(dist)].fc++;
-    flush = (last_lit_ == lit_bufsize_-1);
+    flush = (sym_next_ == sym_end_);
 }
 
 void
 deflate_stream::
 tr_tally_lit(std::uint8_t c, bool& flush)
 {
-    d_buf_[last_lit_] = 0;
-    l_buf_[last_lit_++] = c;
+    sym_buf_[sym_next_++] = 0;
+    sym_buf_[sym_next_++] = 0;
+    sym_buf_[sym_next_++] = c;
     dyn_ltree_[c].fc++;
-    flush = (last_lit_ == lit_bufsize_-1);
+    flush = (sym_next_ == sym_end_);
 }
 
 //------------------------------------------------------------------------------
@@ -1424,22 +1427,22 @@ tr_flush_block(
         opt_lenb = (opt_len_+3+7)>>3;
         static_lenb = (static_len_+3+7)>>3;
 
-        if(static_lenb <= opt_lenb)
+        // zlib's FORCE_STATIC build option is not supported
+    #if 0
+        opt_lenb = static_lenb;
+    #else
+        if(static_lenb <= opt_lenb || strategy_ == Strategy::fixed)
             opt_lenb = static_lenb;
+    #endif
     }
     else
     {
-        // VFALCO This assertion fails even in the original ZLib,
-        //        happens with strategy == Z_HUFFMAN_ONLY, see:
-        //        https://github.com/madler/zlib/issues/172
-
-    #if 0
         BOOST_ASSERT(buf);
-    #endif
         opt_lenb = static_lenb = stored_len + 5; // force a stored block
     }
 
-#ifdef FORCE_STORED
+    // zlib's FORCE_STORED build option is not supported
+#if 0
     if(buf != (char*)0) { /* force stored block */
 #else
     if(stored_len+4 <= opt_lenb && buf != (char*)0) {
@@ -1452,23 +1455,15 @@ tr_flush_block(
          * transform a block into a stored block.
          */
         tr_stored_block(buf, stored_len, last);
-
-#ifdef FORCE_STATIC
     }
-    else if(static_lenb >= 0)
+    else if(static_lenb == opt_lenb)
     {
-        // force static trees
-#else
-    }
-    else if(strategy_ == Strategy::fixed || static_lenb == opt_lenb)
-    {
-#endif
-        send_bits((STATIC_TREES<<1)+last, 3);
+        send_bits((static_trees<<1)+last, 3);
         compress_block(lut_.ltree, lut_.dtree);
     }
     else
     {
-        send_bits((DYN_TREES<<1)+last, 3);
+        send_bits((dyn_trees<<1)+last, 3);
         send_all_trees(l_desc_.max_code+1, d_desc_.max_code+1,
                        max_blindex+1);
         compress_block((const ct_data *)dyn_ltree_,
@@ -1483,14 +1478,58 @@ tr_flush_block(
         bi_windup();
 }
 
+/*  Slide the hash table when sliding the window down (could be avoided with 32
+    bit values at the expense of memory usage). We slide even when level == 0 to
+    keep the hash table consistent if we switch back to level > 0 later.
+*/
+void
+deflate_stream::
+slide_hash()
+{
+    unsigned n, m;
+    std::uint16_t *p;
+    uInt wsize = w_size_;
+
+    n = hash_size_;
+    p = &head_[n];
+    do
+    {
+        m = *--p;
+        *p = (std::uint16_t)(m >= wsize ? m-wsize : 0);
+    }
+    while(--n);
+
+    n = wsize;
+    p = &prev_[n];
+    do
+    {
+        m = *--p;
+        *p = (std::uint16_t)(m >= wsize ? m-wsize : 0);
+        /*  If n is not on any hash chain, prev[n] is garbage but
+            its value will never be used.
+        */
+    }
+    while(--n);
+}
+
+/*  Fill the window when the lookahead becomes insufficient.
+    Updates strstart and lookahead.
+
+    IN assertion: lookahead < kMinLookahead
+    OUT assertions: strstart <= window_size-kMinLookahead
+       At least one byte has been read, or avail_in == 0; reads are
+       performed for at least two bytes (required for the zip translate_eol
+       option -- not supported here).
+*/
 void
 deflate_stream::
 fill_window(z_params& zs)
 {
-    unsigned n, m;
+    unsigned n;
     unsigned more;    // Amount of free space at the end of the window.
-    std::uint16_t *p;
     uInt wsize = w_size_;
+
+    BOOST_ASSERT(lookahead_ < kMinLookahead);
 
     do
     {
@@ -1521,37 +1560,13 @@ fill_window(z_params& zs)
         */
         if(strstart_ >= wsize+max_dist())
         {
-            std::memcpy(window_, window_+wsize, (unsigned)wsize);
+            std::memcpy(window_, window_+wsize, (unsigned)wsize - more);
             match_start_ -= wsize;
             strstart_    -= wsize; // we now have strstart >= max_dist
             block_start_ -= (long) wsize;
-
-            /* Slide the hash table (could be avoided with 32 bit values
-               at the expense of memory usage). We slide even when level == 0
-               to keep the hash table consistent if we switch back to level > 0
-               later. (Using level 0 permanently is not an optimal usage of
-               zlib, so we don't care about this pathological case.)
-            */
-            n = hash_size_;
-            p = &head_[n];
-            do
-            {
-                m = *--p;
-                *p = (std::uint16_t)(m >= wsize ? m-wsize : 0);
-            }
-            while(--n);
-
-            n = wsize;
-            p = &prev_[n];
-            do
-            {
-                m = *--p;
-                *p = (std::uint16_t)(m >= wsize ? m-wsize : 0);
-                /*  If n is not on any hash chain, prev[n] is garbage but
-                    its value will never be used.
-                */
-            }
-            while(--n);
+            if (insert_ > strstart_)
+                insert_ = strstart_;
+            slide_hash();
             more += wsize;
         }
         if(zs.avail_in == 0)
@@ -1568,6 +1583,8 @@ fill_window(z_params& zs)
             Otherwise, window_size == 2*WSIZE so more >= 2.
             If there was sliding, more >= WSIZE. So in all cases, more >= 2.
         */
+        BOOST_ASSERT(more >= 2);
+
         n = read_buf(zs, window_ + strstart_ + lookahead_, more);
         lookahead_ += n;
 
@@ -1630,6 +1647,8 @@ fill_window(z_params& zs)
             high_water_ += winit;
         }
     }
+
+    BOOST_ASSERT((std::uint32_t)strstart_ <= window_size_ - kMinLookahead);
 }
 
 /*  Flush as much pending output as possible. All write() output goes
@@ -1811,80 +1830,203 @@ longest_match(IPos cur_match)
 
 /*  Copy without compression as much as possible from the input stream, return
     the current block state.
-    This function does not insert new strings in the dictionary since
-    uncompressible data is probably not useful. This function is used
-    only for the level=0 compression option.
-    NOTE: this function should be optimized to avoid extra copying from
-    window to pending_buf.
+
+    In case params() is used to later switch to a non-zero compression
+    level, matches_ (otherwise unused when storing) keeps track of the number
+    of hash table slides to perform. If matches_ is 1, then one hash table
+    slide will be done when switching. If matches_ is 2, the maximum value
+    allowed here, then the hash table will be cleared, since two or more slides
+    is the same as a clear.
+
+    f_stored() is written to minimize the number of times an input byte is
+    copied. It is most efficient with large input and output buffers, which
+    maximizes the opportunities to have a single copy from next_in to next_out.
 */
 auto
 deflate_stream::
 f_stored(z_params& zs, Flush flush) ->
     block_state
 {
-    /* Stored blocks are limited to 0xffff bytes, pending_buf is limited
-     * to pending_buf_size, and each stored block has a 5 byte header:
+    /* Smallest worthy block size when not flushing or finishing. By default
+     * this is 32K. This can be as small as 507 bytes for memLevel == 1. For
+     * large input and output buffers, the stored block size will be larger.
      */
-    std::uint32_t max_block_size = 0xffff;
-    std::uint32_t max_start;
+    unsigned min_block = clamp(pending_buf_size_ - 5, w_size_);
 
-    if(max_block_size > pending_buf_size_ - 5) {
-        max_block_size = pending_buf_size_ - 5;
-    }
-
-    /* Copy as much as possible from input to output: */
-    for(;;) {
-        /* Fill the window as much as possible: */
-        if(lookahead_ <= 1) {
-
-            BOOST_ASSERT(strstart_ < w_size_+max_dist() ||
-                   block_start_ >= (long)w_size_);
-
-            fill_window(zs);
-            if(lookahead_ == 0 && flush == Flush::none)
-                return need_more;
-
-            if(lookahead_ == 0) break; /* flush the current block */
-        }
-        BOOST_ASSERT(block_start_ >= 0L);
-
-        strstart_ += lookahead_;
-        lookahead_ = 0;
-
-        /* Emit a stored block if pending_buf will be full: */
-        max_start = block_start_ + max_block_size;
-        if(strstart_ == 0 || (std::uint32_t)strstart_ >= max_start) {
-            /* strstart == 0 is possible when wraparound on 16-bit machine */
-            lookahead_ = (uInt)(strstart_ - max_start);
-            strstart_ = (uInt)max_start;
-            flush_block(zs, false);
-            if(zs.avail_out == 0)
-                return need_more;
-        }
-        /* Flush if we may have to slide, otherwise block_start may become
-         * negative and the data will be gone:
+    /* Copy as many min_block or larger stored blocks directly to next_out as
+     * possible. If flushing, copy the remaining available input to next_out as
+     * stored blocks, if there is enough space.
+     */
+    int last = 0;
+    unsigned len, left, have;
+    std::size_t used = zs.avail_in;
+    do
+    {
+        /* Set len to the maximum size block that we can copy directly with the
+         * available input data and output space. Set left to how much of that
+         * would be copied from what's left in the window.
          */
-        if(strstart_ - (uInt)block_start_ >= max_dist()) {
-            flush_block(zs, false);
-            if(zs.avail_out == 0)
-                return need_more;
+        len = kMaxStored;       /* maximum deflate stored block length */
+        have = ((unsigned)bi_valid_ + 42) >> 3;   /* bytes in header */
+        if(zs.avail_out < have)          /* need room for header */
+            break;
+            /* maximum stored block length that will fit in avail_out: */
+        std::size_t const room = zs.avail_out - have;
+        left = (unsigned)(strstart_ - block_start_);    /* window bytes */
+        if(len > left + zs.avail_in)
+            len = (unsigned)(left + zs.avail_in);   /* limit len to the input */
+        if(len > room)
+            len = (unsigned)room;                   /* limit len to the output */
+
+        /* If the stored block would be less than min_block in length, or if
+         * unable to copy all of the available input when flushing, then try
+         * copying to the window and the pending buffer instead. Also don't
+         * write an empty block when flushing -- write() does that.
+         */
+        if(len < min_block && ((len == 0 && flush != Flush::finish) ||
+                                flush == Flush::none ||
+                                len != left + zs.avail_in))
+            break;
+
+        /* Make a dummy stored block in pending to get the header bytes,
+         * including any pending bits.
+         */
+        last = flush == Flush::finish && len == left + zs.avail_in ? 1 : 0;
+        tr_stored_block(nullptr, 0L, last);
+
+        /* Replace the lengths in the dummy stored block with len. */
+        pending_buf_[pending_ - 4] = (Byte)len;
+        pending_buf_[pending_ - 3] = (Byte)(len >> 8);
+        pending_buf_[pending_ - 2] = (Byte)~len;
+        pending_buf_[pending_ - 1] = (Byte)(~len >> 8);
+
+        /* Write the stored block header bytes. */
+        flush_pending(zs);
+
+        /* Copy uncompressed bytes from the window to next_out. */
+        if(left)
+        {
+            if(left > len)
+                left = len;
+            std::memcpy(zs.next_out, window_ + block_start_, left);
+            zs.next_out = static_cast<std::uint8_t*>(zs.next_out) + left;
+            zs.avail_out -= left;
+            zs.total_out += left;
+            block_start_ += left;
+            len -= left;
+        }
+
+        /* Copy uncompressed bytes directly from next_in to next_out. */
+        if(len)
+        {
+            read_buf(zs, static_cast<Byte*>(zs.next_out), len);
+            zs.next_out = static_cast<std::uint8_t*>(zs.next_out) + len;
+            zs.avail_out -= len;
+            zs.total_out += len;
         }
     }
-    insert_ = 0;
-    if(flush == Flush::finish)
+    while(last == 0);
+
+    /* Update the sliding window with the last w_size_ bytes of the copied
+     * data, or append all of the copied data to the existing window if less
+     * than w_size_ bytes were copied. Also update the number of bytes to
+     * insert in the hash tables, in the event that params() switches to
+     * a non-zero compression level.
+     */
+    used -= zs.avail_in;      /* number of input bytes directly copied */
+    if(used)
     {
-        flush_block(zs, true);
-        if(zs.avail_out == 0)
-            return finish_started;
+        auto const next_in =
+            static_cast<std::uint8_t const*>(zs.next_in);
+        /* If any input was used, then no unused input remains in the window,
+         * therefore block_start_ == strstart_.
+         */
+        if(used >= w_size_)    /* supplant the previous history */
+        {
+            matches_ = 2;         /* clear hash */
+            std::memcpy(window_, next_in - w_size_, w_size_);
+            strstart_ = w_size_;
+            insert_ = strstart_;
+        }
+        else
+        {
+            if(window_size_ - strstart_ <= used)
+            {
+                /* Slide the window down. */
+                strstart_ -= w_size_;
+                std::memcpy(window_, window_ + w_size_, strstart_);
+                if(matches_ < 2)
+                    matches_++;   /* add a pending slide_hash() */
+                if(insert_ > strstart_)
+                    insert_ = strstart_;
+            }
+            std::memcpy(window_ + strstart_, next_in - used, used);
+            strstart_ += (uInt)used;
+            insert_ += clamp((uInt)used, w_size_ - insert_);
+        }
+        block_start_ = strstart_;
+    }
+    if(high_water_ < strstart_)
+        high_water_ = strstart_;
+
+    /* If the last block was written to next_out, then done. */
+    if(last)
         return finish_done;
-    }
-    if((long)strstart_ > block_start_)
+
+    /* If flushing and all input has been consumed, then done. */
+    if(flush != Flush::none && flush != Flush::finish &&
+        zs.avail_in == 0 && (long)strstart_ == block_start_)
+        return block_done;
+
+    /* Fill the window with any remaining input. */
+    have = (unsigned)(window_size_ - strstart_);
+    if(zs.avail_in > have && block_start_ >= (long)w_size_)
     {
-        flush_block(zs, false);
-        if(zs.avail_out == 0)
-            return need_more;
+        /* Slide the window down. */
+        block_start_ -= w_size_;
+        strstart_ -= w_size_;
+        std::memcpy(window_, window_ + w_size_, strstart_);
+        if(matches_ < 2)
+            matches_++;           /* add a pending slide_hash() */
+        have += w_size_;          /* more space now */
+        if(insert_ > strstart_)
+            insert_ = strstart_;
     }
-    return block_done;
+    if(have > zs.avail_in)
+        have = (unsigned)zs.avail_in;
+    if(have)
+    {
+        read_buf(zs, window_ + strstart_, have);
+        strstart_ += have;
+        insert_ += clamp(have, w_size_ - insert_);
+    }
+    if(high_water_ < strstart_)
+        high_water_ = strstart_;
+
+    /* There was not enough avail_out to write a complete worthy or flushed
+     * stored block to next_out. Write a stored block to pending instead, if we
+     * have enough input for a worthy block, or if flushing and there is enough
+     * room for the remaining input as a stored block in the pending buffer.
+     */
+    have = ((unsigned)bi_valid_ + 42) >> 3;   /* bytes in header */
+        /* maximum stored block length that will fit in pending: */
+    have = clamp(pending_buf_size_ - have, kMaxStored);
+    min_block = clamp(have, w_size_);
+    left = (unsigned)(strstart_ - block_start_);
+    if(left >= min_block ||
+        ((left || flush == Flush::finish) && flush != Flush::none &&
+         zs.avail_in == 0 && left <= have))
+    {
+        len = clamp(left, have);
+        last = flush == Flush::finish && zs.avail_in == 0 &&
+               len == left ? 1 : 0;
+        tr_stored_block((char *)window_ + block_start_, len, last);
+        block_start_ += len;
+        flush_pending(zs);
+    }
+
+    /* We've done all we can with the available input and output. */
+    return last ? finish_started : need_more;
 }
 
 /*  Compress as much as possible from the input stream, return the current
@@ -1993,7 +2135,7 @@ f_fast(z_params& zs, Flush flush) ->
             return finish_started;
         return finish_done;
     }
-    if(last_lit_)
+    if(sym_next_)
     {
         flush_block(zs, false);
         if(zs.avail_out == 0)
@@ -2138,7 +2280,7 @@ f_slow(z_params& zs, Flush flush) ->
             return finish_started;
         return finish_done;
     }
-    if(last_lit_)
+    if(sym_next_)
     {
         flush_block(zs, false);
         if(zs.avail_out == 0)
@@ -2187,7 +2329,7 @@ f_rle(z_params& zs, Flush flush) ->
                          prev == *++scan && prev == *++scan &&
                          prev == *++scan && prev == *++scan &&
                          scan < strend);
-                match_length_ = maxMatch - (int)(strend - scan);
+                match_length_ = maxMatch - (uInt)(strend - scan);
                 if(match_length_ > lookahead_)
                     match_length_ = lookahead_;
             }
@@ -2224,7 +2366,7 @@ f_rle(z_params& zs, Flush flush) ->
             return finish_started;
         return finish_done;
     }
-    if(last_lit_)
+    if(sym_next_)
     {
         flush_block(zs, false);
         if(zs.avail_out == 0)
@@ -2278,7 +2420,7 @@ f_huff(z_params& zs, Flush flush) ->
             return finish_started;
         return finish_done;
     }
-    if(last_lit_)
+    if(sym_next_)
     {
         flush_block(zs, false);
         if(zs.avail_out == 0)
